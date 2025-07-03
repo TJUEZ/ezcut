@@ -1,0 +1,41 @@
+{
+  "app": {
+    "window_width": 1200,
+    "window_height": 800,
+    "theme": "clam",
+    "language": "zh_CN"
+  },
+  "video": {
+    "default_bitrate": "10M",
+    "output_format": "mp4",
+    "preview_quality": "medium",
+    "temp_dir": "temp",
+    "output_dir": "output"
+  },
+  "subtitle": {
+    "whisper_model": "base",
+    "use_faster_whisper": true,
+    "default_language": "auto",
+    "font_family": "Microsoft YaHei",
+    "font_size": 24,
+    "font_color": "#FFFFFF",
+    "background_color": "#000000",
+    "background_opacity": 0.7,
+    "position": "bottom",
+    "alignment": "center"
+  },
+  "ui": {
+    "show_toolbar": true,
+    "show_statusbar": true,
+    "auto_save": true,
+    "auto_save_interval": 300,
+    "recent_files_count": 10,
+    "recent_files": []
+  },
+  "performance": {
+    "max_threads": 4,
+    "memory_limit": "2GB",
+    "gpu_acceleration": false,
+    "cache_size": "1GB"
+  }
+}
