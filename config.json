@@ -29,7 +29,15 @@
     "show_statusbar": true,
     "auto_save": true,
     "auto_save_interval": 300,
-    "recent_files_count": 10
+    "recent_files_count": 10,
+    "dpi_awareness": true,
+    "ui_scale": "auto",
+    "font_scale": 1.0,
+    "modern_theme": true,
+    "dark_mode": false,
+    "accent_color": "#0078d4",
+    "panel_spacing": 5,
+    "button_padding": 8
   },
   "performance": {
     "max_threads": 4,

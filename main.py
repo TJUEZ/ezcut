@@ -20,26 +20,45 @@ import os
 import sys
 from pathlib import Path
 
+# 尝试导入拖拽支持
+try:
+    import tkinterdnd2 as tkdnd
+    DND_AVAILABLE = True
+except ImportError:
+    DND_AVAILABLE = False
+
 # 导入自定义模块
 from src.video_processor import VideoProcessor
 from src.subtitle_manager import SubtitleManager
 from src.gui.main_window import MainWindow
+from src.gui.theme_manager import ThemeManager
 from src.utils.config import Config
 
 class EzCutApp:
     """EzCut主应用程序类"""
     
     def __init__(self):
-        self.root = tk.Tk()
+        # 根据是否有拖拽支持选择不同的根窗口
+        if DND_AVAILABLE:
+            self.root = tkdnd.TkinterDnD.Tk()
+        else:
+            self.root = tk.Tk()
         self.root.title("EzCut - 智能视频剪辑软件")
-        self.root.geometry("1200x800")
-        self.root.minsize(800, 600)
-        
-        # 设置应用图标和样式
-        self.setup_styles()
         
         # 初始化配置
         self.config = Config()
+        
+        # 初始化主题管理器
+        self.theme_manager = ThemeManager(self.config.config_data)
+        
+        # 应用主题和DPI适配
+        self.theme_manager.apply_theme(self.root)
+        
+        # 设置窗口大小（考虑DPI缩放）
+        width = self.theme_manager.scale_size(self.config.get('app.window_width', 1200))
+        height = self.theme_manager.scale_size(self.config.get('app.window_height', 800))
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(self.theme_manager.scale_size(800), self.theme_manager.scale_size(600))
         
         # 初始化核心组件
         self.video_processor = VideoProcessor()
@@ -51,14 +70,9 @@ class EzCutApp:
         # 绑定事件
         self.setup_events()
     
-    def setup_styles(self):
-        """设置应用样式"""
-        style = ttk.Style()
-        style.theme_use('clam')
-        
-        # 自定义颜色主题
-        style.configure('Title.TLabel', font=('Arial', 16, 'bold'))
-        style.configure('Subtitle.TLabel', font=('Arial', 10))
+    def get_theme_manager(self):
+        """获取主题管理器"""
+        return self.theme_manager
         
     def setup_events(self):
         """设置事件绑定"""
@@ -137,6 +151,13 @@ def check_environment():
     except ImportError:
         optional_missing.append("openai-whisper")
         print("⚠ Whisper未安装 - 自动字幕识别功能不可用")
+    
+    try:
+        import tkinterdnd2
+        print("✓ TkinterDnD2已安装 - 拖拽功能可用")
+    except ImportError:
+        optional_missing.append("tkinterdnd2")
+        print("⚠ TkinterDnD2未安装 - 拖拽功能不可用")
     
     if missing_packages:
         print("\n❌ 缺少必需依赖包，程序无法正常运行")

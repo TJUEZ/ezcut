@@ -1,0 +1,40 @@
+# EzCut PyQt6 视频编辑器依赖包
+# 安装命令: pip install -r requirements_qt.txt
+
+# 核心GUI框架
+PyQt6>=6.4.0
+PyQt6-Qt6>=6.4.0
+
+# 视频处理
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# 高级视频编辑 (可选)
+moviepy>=1.0.3
+
+# 图像处理
+Pillow>=9.5.0
+
+# 音频处理 (可选)
+pydub>=0.25.1
+
+# 系统工具
+psutil>=5.9.0
+
+# 文件处理
+send2trash>=1.8.0
+
+# 配置文件
+toml>=0.10.2
+
+# 日志
+loguru>=0.7.0
+
+# 进度条
+tqdm>=4.65.0
+
+# 多媒体元数据
+mutagen>=1.46.0
+
+# FFmpeg Python绑定 (可选)
+ffmpeg-python>=0.2.0

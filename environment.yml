@@ -11,8 +11,8 @@ dependencies:
   - tqdm
   - requests
   - pip:
-    - moviepy
-    - pysrt
-    - tkinter
-    - whisper
-    - faster-whisper
+      - moviepy
+      - pysrt
+      - tkinter
+      - whisper
+      - faster-whisper

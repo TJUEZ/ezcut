@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EzCut - 专业视频编辑器</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- 顶部工具栏 -->
+        <header class="toolbar">
+            <div class="toolbar-section">
+                <button class="btn" id="import-btn"><i class="fas fa-upload"></i> 导入</button>
+                <button class="btn" id="export-btn"><i class="fas fa-download"></i> 导出</button>
+            </div>
+            <div class="toolbar-section">
+                <button class="btn" id="play-btn"><i class="fas fa-play"></i></button>
+                <button class="btn" id="pause-btn"><i class="fas fa-pause"></i></button>
+                <button class="btn" id="stop-btn"><i class="fas fa-stop"></i></button>
+            </div>
+            <div class="toolbar-section">
+                <button class="btn" id="cut-btn"><i class="fas fa-cut"></i> 剪切</button>
+                <button class="btn" id="copy-btn"><i class="fas fa-copy"></i> 复制</button>
+                <button class="btn" id="paste-btn"><i class="fas fa-paste"></i> 粘贴</button>
+            </div>
+        </header>
+
+        <!-- 主要工作区 -->
+        <main class="workspace">
+            <!-- 左侧面板 - 媒体库 -->
+            <aside class="sidebar left">
+                <div class="panel">
+                    <h3>媒体库</h3>
+                    <div class="media-library" id="media-library">
+                        <div class="drop-zone" id="drop-zone">
+                            <i class="fas fa-cloud-upload-alt"></i>
+                            <p>拖拽文件到这里或点击上传</p>
+                            <input type="file" id="file-input" multiple accept="video/*,audio/*,image/*" style="display: none;">
+                        </div>
+                        <div class="media-items" id="media-items"></div>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- 中央预览区 -->
+            <section class="preview-area">
+                <div class="video-preview">
+                    <canvas id="preview-canvas" width="640" height="360"></canvas>
+                    <div class="preview-controls">
+                        <div class="time-display">
+                            <span id="current-time">00:00</span> / <span id="total-time">00:00</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 右侧面板 - 属性 -->
+            <aside class="sidebar right">
+                <div class="panel">
+                    <h3>属性</h3>
+                    <div class="properties" id="properties">
+                        <div class="property-group">
+                            <label>位置 X:</label>
+                            <input type="number" id="pos-x" value="0">
+                        </div>
+                        <div class="property-group">
+                            <label>位置 Y:</label>
+                            <input type="number" id="pos-y" value="0">
+                        </div>
+                        <div class="property-group">
+                            <label>缩放:</label>
+                            <input type="range" id="scale" min="0.1" max="3" step="0.1" value="1">
+                            <span id="scale-value">1.0</span>
+                        </div>
+                        <div class="property-group">
+                            <label>透明度:</label>
+                            <input type="range" id="opacity" min="0" max="1" step="0.1" value="1">
+                            <span id="opacity-value">1.0</span>
+                        </div>
+                    </div>
+                </div>
+            </aside>
+        </main>
+
+        <!-- 底部时间轴 -->
+        <footer class="timeline-container">
+            <div class="timeline-header">
+                <div class="track-controls">
+                    <button class="btn small" id="add-track-btn"><i class="fas fa-plus"></i> 添加轨道</button>
+                </div>
+                <div class="timeline-ruler" id="timeline-ruler"></div>
+            </div>
+            <div class="timeline" id="timeline">
+                <div class="tracks" id="tracks">
+                    <!-- 轨道将动态生成 -->
+                </div>
+                <div class="playhead" id="playhead"></div>
+            </div>
+        </footer>
+    </div>
+
+    <!-- 模态对话框 -->
+    <div id="export-modal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>导出设置</h2>
+            <form id="export-form">
+                <div class="form-group">
+                    <label>格式:</label>
+                    <select id="export-format">
+                        <option value="mp4">MP4</option>
+                        <option value="webm">WebM</option>
+                        <option value="avi">AVI</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>质量:</label>
+                    <select id="export-quality">
+                        <option value="high">高质量</option>
+                        <option value="medium">中等质量</option>
+                        <option value="low">低质量</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <button type="submit" class="btn primary">开始导出</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- 加载脚本 -->
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://code.jquery.com/ui/1.13.2/jquery-ui.min.js"></script>
+    <script src="https://unpkg.com/etro@2.0.0/dist/etro.min.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
