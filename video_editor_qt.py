@@ -1007,6 +1007,8 @@ class VideoPreviewWidget(QWidget):
         # 视频显示区域
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumSize(400, 300)
+        # 设置背景色以便调试
+        self.video_widget.setStyleSheet("background-color: #2b2b2b; border: 1px solid #555;")
         layout.addWidget(self.video_widget)
         
         # 播放控制
@@ -1025,10 +1027,17 @@ class VideoPreviewWidget(QWidget):
         layout.addLayout(controls)
         
         # 媒体播放器
+        print("[DEBUG] 初始化QMediaPlayer...")
         self.media_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
+        
+        # 设置音频输出
         self.media_player.setAudioOutput(self.audio_output)
+        print(f"[DEBUG] 音频输出已设置: {self.audio_output}")
+        
+        # 设置视频输出
         self.media_player.setVideoOutput(self.video_widget)
+        print(f"[DEBUG] 视频输出已设置: {self.video_widget}")
         
         # 连接信号
         self.play_btn.clicked.connect(self.toggle_playback)
@@ -1040,6 +1049,8 @@ class VideoPreviewWidget(QWidget):
         self.media_player.errorOccurred.connect(self.handle_error)
         self.media_player.playbackStateChanged.connect(self.handle_state_change)
         self.media_player.mediaStatusChanged.connect(self.handle_media_status_change)
+        
+        print(f"[DEBUG] QMediaPlayer初始化完成，初始状态: {self.media_player.playbackState()}")
     
     def load_media(self, file_path):
         """加载媒体文件"""
@@ -1054,18 +1065,69 @@ class VideoPreviewWidget(QWidget):
         # 检查文件是否存在
         import os
         if not os.path.exists(file_path_str):
-            print(f"错误: 文件不存在 - {file_path_str}")
+            print(f"[ERROR] 文件不存在 - {file_path_str}")
             return
             
+        # 检查文件大小
+        file_size = os.path.getsize(file_path_str)
+        print(f"[DEBUG] 文件大小: {file_size / (1024*1024):.2f}MB")
+        
+        # 检查文件扩展名
+        file_ext = os.path.splitext(file_path_str)[1].lower()
+        print(f"[DEBUG] 文件扩展名: {file_ext}")
+        
         # 设置媒体源
         media_url = QUrl.fromLocalFile(file_path_str)
-        print(f"正在加载媒体: {file_path_str}")
-        print(f"媒体URL: {media_url.toString()}")
+        print(f"[DEBUG] 正在加载媒体: {file_path_str}")
+        print(f"[DEBUG] 媒体URL: {media_url.toString()}")
+        print(f"[DEBUG] URL是否有效: {media_url.isValid()}")
+        print(f"[DEBUG] URL是否为本地文件: {media_url.isLocalFile()}")
         
+        # 停止当前播放
+        print(f"[DEBUG] 停止当前播放，当前状态: {self.media_player.playbackState()}")
+        self.media_player.stop()
+        
+        # 设置新的媒体源
+        print(f"[DEBUG] 设置媒体源...")
         self.media_player.setSource(media_url)
         
         # 重置播放按钮状态
         self.play_btn.setText("▶")
+        
+        print(f"[DEBUG] 媒体源已设置，当前播放状态: {self.media_player.playbackState()}")
+        print(f"[DEBUG] 媒体状态: {self.media_player.mediaStatus()}")
+        print(f"[DEBUG] 媒体持续时间: {self.media_player.duration()}ms")
+        print(f"[DEBUG] 视频输出对象: {self.media_player.videoOutput()}")
+        print(f"[DEBUG] 音频输出对象: {self.media_player.audioOutput()}")
+        
+        # 尝试立即播放以测试
+        print(f"[DEBUG] 尝试立即播放进行测试...")
+        self.media_player.play()
+        
+        # 等待一小段时间后检查状态
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(1000, self.check_media_load_status)
+    
+    def check_media_load_status(self):
+        """检查媒体加载状态"""
+        print(f"[DEBUG] === 媒体加载状态检查 ===")
+        print(f"[DEBUG] 播放状态: {self.media_player.playbackState()}")
+        print(f"[DEBUG] 媒体状态: {self.media_player.mediaStatus()}")
+        print(f"[DEBUG] 媒体持续时间: {self.media_player.duration()}ms")
+        print(f"[DEBUG] 当前位置: {self.media_player.position()}ms")
+        print(f"[DEBUG] 是否有错误: {self.media_player.error()}")
+        print(f"[DEBUG] 视频输出连接状态: {self.media_player.videoOutput() is not None}")
+        print(f"[DEBUG] 音频输出连接状态: {self.media_player.audioOutput() is not None}")
+        
+        # 如果媒体状态是无效的，尝试其他方法
+        if self.media_player.mediaStatus() == QMediaPlayer.MediaStatus.InvalidMedia:
+            print(f"[ERROR] 媒体无效，可能是格式不支持")
+        elif self.media_player.mediaStatus() == QMediaPlayer.MediaStatus.LoadedMedia:
+            print(f"[SUCCESS] 媒体已成功加载")
+        elif self.media_player.mediaStatus() == QMediaPlayer.MediaStatus.NoMedia:
+            print(f"[ERROR] 没有媒体源")
+        
+        print(f"[DEBUG] === 状态检查结束 ===")
     
     def toggle_playback(self):
         """切换播放/暂停"""
@@ -1073,8 +1135,24 @@ class VideoPreviewWidget(QWidget):
             self.media_player.pause()
             self.play_btn.setText("▶")
         else:
+            # 如果没有加载媒体，尝试智能处理
+            if not self.current_media:
+                main_window = self.get_main_window()
+                if main_window:
+                    main_window.smart_play_handler()
+                    return
+            
             self.media_player.play()
             self.play_btn.setText("⏸")
+    
+    def get_main_window(self):
+        """获取主窗口引用"""
+        parent = self.parent()
+        while parent:
+            if isinstance(parent, QMainWindow):
+                return parent
+            parent = parent.parent()
+        return None
     
     def update_position(self, position):
         """更新播放位置"""
@@ -1200,6 +1278,9 @@ class MainWindow(QMainWindow):
         
         # 建立视频预览和时间轴的连接
         self.video_preview.timeline_widget = self.timeline
+        
+        # 连接视频预览器的播放状态变化信号到工具栏更新
+        self.video_preview.media_player.playbackStateChanged.connect(self.update_toolbar_play_button)
         
         center_splitter.addWidget(timeline_container)
         center_splitter.setSizes([400, 300])
@@ -1332,13 +1413,15 @@ class MainWindow(QMainWindow):
         toolbar = self.addToolBar("主工具栏")
         
         # 播放控制
-        play_action = QAction("▶", self)
-        play_action.setToolTip("播放/暂停")
-        toolbar.addAction(play_action)
+        self.play_action = QAction("▶", self)
+        self.play_action.setToolTip("播放/暂停")
+        self.play_action.triggered.connect(self.toggle_timeline_playback)
+        toolbar.addAction(self.play_action)
         
-        stop_action = QAction("⏹", self)
-        stop_action.setToolTip("停止")
-        toolbar.addAction(stop_action)
+        self.stop_action = QAction("⏹", self)
+        self.stop_action.setToolTip("停止")
+        self.stop_action.triggered.connect(self.stop_timeline_playback)
+        toolbar.addAction(self.stop_action)
         
         toolbar.addSeparator()
         
@@ -1390,6 +1473,137 @@ class MainWindow(QMainWindow):
         if file_path:
             # 这里应该实现实际的视频导出逻辑
             QMessageBox.information(self, "导出", f"视频将导出到: {file_path}")
+    
+    def toggle_timeline_playback(self):
+        """切换时间轴播放状态"""
+        if self.video_preview.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            # 当前正在播放，暂停
+            self.video_preview.media_player.pause()
+            self.play_action.setText("▶")
+            self.play_action.setToolTip("播放")
+        else:
+            # 当前暂停或停止，开始播放
+            if self.video_preview.current_media:
+                # 如果有加载的媒体，直接播放
+                self.video_preview.media_player.play()
+                self.play_action.setText("⏸")
+                self.play_action.setToolTip("暂停")
+            else:
+                # 如果没有加载媒体，智能处理播放请求
+                self.smart_play_handler()
+    
+    def stop_timeline_playback(self):
+        """停止时间轴播放"""
+        self.video_preview.media_player.stop()
+        self.play_action.setText("▶")
+        self.play_action.setToolTip("播放")
+        
+        # 重置播放头到开始位置
+        self.timeline.update_playhead_position(0.0)
+    
+    def smart_play_handler(self):
+        """智能播放处理器 - 自动处理媒体加载和播放"""
+        print(f"[DEBUG] 智能播放处理器启动")
+        
+        # 优先级1: 检查时间轴上是否有剪辑
+        if self.timeline.clips:
+            print(f"[DEBUG] 时间轴上有剪辑，尝试播放")
+            self.play_timeline_at_current_position()
+            return
+        
+        # 优先级2: 检查媒体库中是否有媒体文件
+        if self.media_library.media_items:
+            print(f"[DEBUG] 媒体库中有文件，自动加载第一个文件")
+            first_media = self.media_library.media_items[0]
+            self.video_preview.load_media(first_media.file_path)
+            
+            # 延迟播放，等待媒体加载完成
+            QTimer.singleShot(500, lambda: self.start_playback_after_load())
+            return
+        
+        # 优先级3: 没有任何媒体，提示用户导入
+        result = QMessageBox.question(
+            self,
+            "导入媒体",
+            "还没有导入任何媒体文件。\n\n是否现在导入媒体文件？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        
+        if result == QMessageBox.StandardButton.Yes:
+            # 自动打开导入对话框
+            self.media_library.import_media()
+    
+    def start_playback_after_load(self):
+        """媒体加载后开始播放"""
+        if self.video_preview.current_media:
+            self.video_preview.media_player.play()
+            self.play_action.setText("⏸")
+            self.play_action.setToolTip("暂停")
+            print(f"[DEBUG] 自动播放已开始")
+    
+    def play_timeline_at_current_position(self):
+        """在当前时间轴位置播放剪辑"""
+        current_time = self.timeline.get_current_time()
+        print(f"[DEBUG] 尝试播放时间轴位置: {current_time:.2f}s")
+        print(f"[DEBUG] 时间轴上的剪辑数量: {len(self.timeline.clips)}")
+        
+        # 查找当前时间位置的剪辑
+        active_clip = None
+        for i, clip in enumerate(self.timeline.clips):
+            clip_start = clip.start_time
+            clip_end = clip.start_time + clip.duration
+            print(f"[DEBUG] 剪辑 {i}: {clip.media_item.name}, 时间范围: {clip_start:.2f}s - {clip_end:.2f}s")
+            
+            if clip_start <= current_time <= clip_end:
+                active_clip = clip
+                print(f"[DEBUG] 找到活动剪辑: {clip.media_item.name}")
+                break
+        
+        if active_clip:
+            print(f"[DEBUG] 加载媒体文件: {active_clip.media_item.file_path}")
+            # 加载并播放找到的剪辑
+            self.video_preview.load_media(active_clip.media_item.file_path)
+            
+            # 设置播放位置到剪辑内的相对时间
+            relative_time = current_time - active_clip.start_time
+            position_ms = int(relative_time * 1000)
+            print(f"[DEBUG] 设置播放位置: {relative_time:.2f}s ({position_ms}ms)")
+            self.video_preview.media_player.setPosition(position_ms)
+            
+            # 开始播放
+            print(f"[DEBUG] 开始播放")
+            self.video_preview.media_player.play()
+            self.play_action.setText("⏸")
+            self.play_action.setToolTip("暂停")
+            
+            print(f"播放剪辑: {active_clip.media_item.name}，从 {relative_time:.2f}s 开始")
+        else:
+            print(f"[DEBUG] 在时间轴位置 {current_time:.2f}s 处没有找到剪辑")
+            # 如果时间轴上有剪辑但当前位置没有，尝试播放第一个剪辑
+            if self.timeline.clips:
+                first_clip = self.timeline.clips[0]
+                print(f"[DEBUG] 播放第一个剪辑: {first_clip.media_item.name}")
+                self.video_preview.load_media(first_clip.media_item.file_path)
+                self.video_preview.media_player.setPosition(0)
+                self.video_preview.media_player.play()
+                self.play_action.setText("⏸")
+                self.play_action.setToolTip("暂停")
+                # 更新播放头到第一个剪辑的开始位置
+                self.timeline.update_playhead_position(first_clip.start_time)
+    
+    def update_toolbar_play_button(self, state):
+        """根据播放状态更新工具栏播放按钮"""
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.play_action.setText("⏸")
+            self.play_action.setToolTip("暂停")
+            # 同步更新视频预览器的播放按钮
+            self.video_preview.play_btn.setText("⏸")
+        else:
+            self.play_action.setText("▶")
+            self.play_action.setToolTip("播放")
+            # 同步更新视频预览器的播放按钮
+            self.video_preview.play_btn.setText("▶")
     
     def show_about(self):
         """显示关于对话框"""
