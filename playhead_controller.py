@@ -129,17 +129,24 @@ class PlayheadController(QObject):
             self.scrub_started.emit()
             print(f"[PlayheadController] 开始拖动播放头")
     
-    def handle_drag(self, time_position: float):
+    def handle_drag(self, time_position: float) -> bool:
         """处理拖动"""
+        handled = False
+        
         if self.interaction_mode == 'click':
             # 检查是否超过拖动阈值
             time_diff = abs(time_position - self.drag_start_time)
             if time_diff > 0.1:  # 100ms阈值
                 self.handle_drag_start(time_position)
+                handled = True
         
         if self.interaction_mode == 'drag':
             # 更新播放头位置（带性能优化）
             self._update_position_throttled(time_position, scrub=True)
+            handled = True
+            print(f"[PlayheadController] 拖动播放头到: {time_position:.3f}s")
+        
+        return handled
     
     def handle_drag_end(self):
         """结束拖动"""

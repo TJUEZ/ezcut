@@ -342,8 +342,9 @@ class TimelineRenderer(QObject):
         self.clips: List[TimelineClip] = []
         self.current_time = 0.0
         self.fps = 30.0
-        self.resolution = (1920, 1080)
+        self.resolution = (1280, 720)  # 降低默认分辨率，提高性能
         self.is_rendering = False
+        self.auto_resolution = True  # 自动调整分辨率
         
         # 渲染缓存
         self.frame_cache = {}
@@ -493,6 +494,10 @@ class TimelineRenderer(QObject):
             if not cap.isOpened():
                 return None
                 
+            # 获取原始视频尺寸
+            original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                
             # 设置到指定时间
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_number = int(time_seconds * fps)
@@ -502,8 +507,13 @@ class TimelineRenderer(QObject):
             cap.release()
             
             if ret:
-                # 调整到目标分辨率
-                frame_resized = cv2.resize(frame, self.resolution)
+                # 只有当目标分辨率小于原始分辨率时才进行缩放
+                if self.resolution[0] < original_width or self.resolution[1] < original_height:
+                    # 使用高质量插值算法进行缩放
+                    frame_resized = cv2.resize(frame, self.resolution, interpolation=cv2.INTER_LANCZOS4)
+                else:
+                    # 保持原始尺寸或进行高质量放大
+                    frame_resized = cv2.resize(frame, self.resolution, interpolation=cv2.INTER_CUBIC)
                 return cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
             else:
                 return None
@@ -517,8 +527,16 @@ class TimelineRenderer(QObject):
         try:
             image = cv2.imread(str(image_path))
             if image is not None:
-                # 调整到目标分辨率
-                image_resized = cv2.resize(image, self.resolution)
+                # 获取原始图片尺寸
+                original_height, original_width = image.shape[:2]
+                
+                # 使用高质量插值算法进行缩放
+                if self.resolution[0] < original_width or self.resolution[1] < original_height:
+                    # 缩小时使用LANCZOS4算法
+                    image_resized = cv2.resize(image, self.resolution, interpolation=cv2.INTER_LANCZOS4)
+                else:
+                    # 放大时使用CUBIC算法
+                    image_resized = cv2.resize(image, self.resolution, interpolation=cv2.INTER_CUBIC)
                 return cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB)
             else:
                 return None
@@ -641,6 +659,25 @@ class MediaLibraryWidget(QWidget):
         
         layout.addLayout(header)
         
+        # 媒体库缩放控制
+        zoom_layout = QHBoxLayout()
+        zoom_label = QLabel("缩放:")
+        zoom_layout.addWidget(zoom_label)
+        
+        self.media_zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.media_zoom_slider.setRange(50, 200)  # 50% 到 200%
+        self.media_zoom_slider.setValue(100)  # 默认100%
+        self.media_zoom_slider.setFixedWidth(100)
+        self.media_zoom_slider.valueChanged.connect(self.on_media_zoom_changed)
+        zoom_layout.addWidget(self.media_zoom_slider)
+        
+        self.media_zoom_label = QLabel("100%")
+        self.media_zoom_label.setFixedWidth(40)
+        zoom_layout.addWidget(self.media_zoom_label)
+        
+        zoom_layout.addStretch()
+        layout.addLayout(zoom_layout)
+        
         # 媒体列表 - 使用自定义组件
         self.media_list = CustomMediaListWidget()
         self.media_list.media_library = self  # 设置引用
@@ -723,6 +760,27 @@ class MediaLibraryWidget(QWidget):
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+    
+    def on_media_zoom_changed(self, zoom_value):
+        """媒体库缩放改变时的回调"""
+        self.media_zoom_label.setText(f"{zoom_value}%")
+        
+        # 计算新的图标和网格尺寸
+        base_icon_width = 120
+        base_icon_height = 90
+        base_grid_width = 140
+        base_grid_height = 130
+        
+        new_icon_width = int(base_icon_width * zoom_value / 100)
+        new_icon_height = int(base_icon_height * zoom_value / 100)
+        new_grid_width = int(base_grid_width * zoom_value / 100)
+        new_grid_height = int(base_grid_height * zoom_value / 100)
+        
+        # 更新媒体列表的图标和网格尺寸
+        self.media_list.setIconSize(QSize(new_icon_width, new_icon_height))
+        self.media_list.setGridSize(QSize(new_grid_width, new_grid_height))
+        
+        print(f"媒体库缩放已更改为: {zoom_value}% (图标: {new_icon_width}x{new_icon_height}, 网格: {new_grid_width}x{new_grid_height})")
     
     def on_item_hover(self, item):
         """处理媒体项悬停事件"""
@@ -1138,10 +1196,10 @@ class TimelineToolbar(QWidget):
         zoom_layout.addWidget(self.zoom_out_btn)
         
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        self.zoom_slider.setRange(10, 200)  # 10% 到 200%
-        self.zoom_slider.setValue(100)  # 默认100%
+        self.zoom_slider.setRange(1, 5000)  # 0.1% 到 500% (值除以10得到实际百分比)
+        self.zoom_slider.setValue(1000)  # 默认100% (1000/10=100)
         self.zoom_slider.setFixedWidth(100)
-        self.zoom_slider.setToolTip("调整时间轴缩放比例")
+        self.zoom_slider.setToolTip("调整时间轴缩放比例 (0.1% - 500%)")
         zoom_layout.addWidget(self.zoom_slider)
         
         self.zoom_in_btn = QPushButton("🔍+")
@@ -1276,19 +1334,35 @@ class TimelineToolbar(QWidget):
     def zoom_out(self):
         """缩小"""
         current_value = self.zoom_slider.value()
-        new_value = max(10, current_value - 10)
+        # 根据当前值调整步长，小值时步长小，大值时步长大
+        if current_value <= 100:  # 0.1% - 10%
+            step = 1
+        elif current_value <= 1000:  # 10% - 100%
+            step = 50
+        else:  # 100% - 500%
+            step = 100
+        new_value = max(1, current_value - step)
         self.zoom_slider.setValue(new_value)
     
     def zoom_in(self):
         """放大"""
         current_value = self.zoom_slider.value()
-        new_value = min(200, current_value + 10)
+        # 根据当前值调整步长
+        if current_value < 100:  # 0.1% - 10%
+            step = 1
+        elif current_value < 1000:  # 10% - 100%
+            step = 50
+        else:  # 100% - 500%
+            step = 100
+        new_value = min(5000, current_value + step)
         self.zoom_slider.setValue(new_value)
     
     def on_zoom_changed(self, value):
         """缩放值改变"""
-        self.zoom_label.setText(f"{value}%")
-        zoom_factor = value / 100.0
+        # 将滑块值转换为实际百分比 (值除以10)
+        actual_percentage = value / 10.0
+        self.zoom_label.setText(f"{actual_percentage:.1f}%")
+        zoom_factor = actual_percentage / 100.0
         self.zoomChanged.emit(zoom_factor)
     
     def update_current_time(self, time_seconds):
@@ -1302,6 +1376,135 @@ class TimelineToolbar(QWidget):
         minutes = int(time_seconds // 60)
         seconds = int(time_seconds % 60)
         self.total_time_label.setText(f"{minutes:02d}:{seconds:02d}")
+
+class TimelineRulerWidget(QWidget):
+    """固定的时间刻度条组件"""
+    
+    def __init__(self):
+        super().__init__()
+        self.pixels_per_second = 50
+        self.timeline_duration = 300
+        self.current_time = 0.0
+        self.ruler_height = 30
+        self.setFixedHeight(self.ruler_height)
+        self.setStyleSheet("background-color: #f0f0f0; border-bottom: 1px solid #c0c0c0;")
+        
+    def set_timeline_params(self, pixels_per_second, timeline_duration, current_time):
+        """设置时间轴参数"""
+        self.pixels_per_second = pixels_per_second
+        self.timeline_duration = timeline_duration
+        self.current_time = current_time
+        self.update()
+        
+    def paintEvent(self, event):
+        """绘制时间刻度条"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # 绘制背景
+        painter.fillRect(self.rect(), QColor(240, 240, 240))
+        
+        # 根据缩放级别动态调整刻度间隔，支持帧级别精度
+        fps = 30.0  # 假设30fps
+        frame_duration = 1.0 / fps  # 每帧的时长
+        
+        if self.pixels_per_second >= 1000:  # 极高缩放级别，显示每帧
+            major_interval = frame_duration * 10  # 每10帧一个主刻度
+            minor_interval = frame_duration  # 每帧一个小刻度
+            show_minor = True
+            show_frames = True
+        elif self.pixels_per_second >= 500:  # 超高缩放级别，显示每5帧
+            major_interval = frame_duration * 30  # 每30帧(1秒)一个主刻度
+            minor_interval = frame_duration * 5  # 每5帧一个小刻度
+            show_minor = True
+            show_frames = True
+        elif self.pixels_per_second >= 200:  # 很高缩放级别，显示每0.1秒
+            major_interval = 1.0  # 每秒
+            minor_interval = 0.1  # 每0.1秒
+            show_minor = True
+            show_frames = False
+        elif self.pixels_per_second >= 100:  # 高缩放级别，显示每0.2秒
+            major_interval = 1
+            minor_interval = 0.2
+            show_minor = True
+            show_frames = False
+        elif self.pixels_per_second >= 50:  # 中等缩放级别，显示每秒
+            major_interval = 5
+            minor_interval = 1
+            show_minor = True
+            show_frames = False
+        elif self.pixels_per_second >= 20:  # 低缩放级别，显示每10秒
+            major_interval = 10
+            minor_interval = 2
+            show_minor = True
+            show_frames = False
+        else:  # 很低缩放级别，显示每30秒
+            major_interval = 30
+            minor_interval = 10
+            show_minor = False
+            show_frames = False
+        
+        # 绘制主刻度
+        current_time = 0
+        while current_time <= self.timeline_duration:
+            x = current_time * self.pixels_per_second
+            if x > self.width():
+                break
+                
+            # 主刻度线
+            painter.setPen(QPen(QColor(80, 80, 80), 2))
+            painter.drawLine(int(x), 0, int(x), 20)
+            
+            # 时间标签
+            if show_frames and self.pixels_per_second >= 500:
+                # 在高缩放级别显示帧号
+                frame_number = int(current_time * fps)
+                time_text = f"{frame_number:04d}f"
+            else:
+                # 显示时间格式
+                minutes = int(current_time) // 60
+                seconds = int(current_time) % 60
+                if current_time >= 3600:  # 超过1小时显示小时
+                    hours = int(current_time) // 3600
+                    minutes = (int(current_time) % 3600) // 60
+                    time_text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                else:
+                    time_text = f"{minutes:02d}:{seconds:02d}"
+            
+            painter.setPen(QPen(QColor(60, 60, 60)))
+            painter.setFont(QFont("Arial", 9))
+            painter.drawText(int(x) + 3, 15, time_text)
+            
+            current_time += major_interval
+        
+        # 绘制次刻度
+        if show_minor and minor_interval < major_interval:
+            current_time = 0
+            while current_time <= self.timeline_duration:
+                if current_time % major_interval != 0:  # 不与主刻度重叠
+                    x = current_time * self.pixels_per_second
+                    if x > self.width():
+                        break
+                    painter.setPen(QPen(QColor(120, 120, 120), 1))
+                    painter.drawLine(int(x), 0, int(x), 10)
+                current_time += minor_interval
+        
+        # 绘制播放头
+        playhead_x = self.current_time * self.pixels_per_second
+        if 0 <= playhead_x <= self.width():
+            painter.setPen(QPen(QColor(255, 0, 0), 3))
+            painter.drawLine(int(playhead_x), 0, int(playhead_x), self.ruler_height)
+            
+            # 播放头三角形
+            triangle_size = 8
+            triangle_points = [
+                QPoint(int(playhead_x), 0),
+                QPoint(int(playhead_x - triangle_size), triangle_size),
+                QPoint(int(playhead_x + triangle_size), triangle_size)
+            ]
+            painter.setBrush(QBrush(QColor(255, 0, 0)))
+            painter.setPen(QPen(QColor(180, 0, 0), 1))
+            painter.drawPolygon(triangle_points)
 
 class TimelineWidget(QGraphicsView):
     was_playing_before_scrub = False # 用于记录拖动前是否在播放
@@ -1377,20 +1580,15 @@ class TimelineWidget(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # 设置场景大小，包含时间标尺区域
+        # 设置场景大小，不包含时间标尺区域（时间标尺现在是独立组件）
         scene_width = self.timeline_duration * self.pixels_per_second
         scene_height = self.tracks * self.track_height
-        ruler_height = 30
-        # 场景从-ruler_height开始，确保时间标尺可见
-        self.scene.setSceneRect(0, -ruler_height, scene_width, scene_height + ruler_height)
+        self.scene.setSceneRect(0, 0, scene_width, scene_height)
         
         # 绘制轨道背景
         self.draw_tracks()
         
-        # 绘制时间标尺
-        self.draw_time_ruler()
-        
-        # 绘制播放头
+        # 绘制播放头（不包含时间标尺）
         self.draw_playhead()
     
     def draw_tracks(self):
@@ -1411,69 +1609,7 @@ class TimelineWidget(QGraphicsView):
             label = self.scene.addText(f"轨道 {i+1}", QFont("Arial", 10))
             label.setPos(5, y + 5)
     
-    def draw_time_ruler(self):
-        """绘制可缩放的时间标尺"""
-        ruler_height = 30
-        ruler_rect = QGraphicsRectItem(0, -ruler_height, self.scene.width(), ruler_height)
-        ruler_rect.setBrush(QBrush(QColor(240, 240, 240)))
-        ruler_rect.setPen(QPen(QColor(200, 200, 200)))
-        ruler_rect.setZValue(1)  # 确保标尺在轨道下方
-        self.scene.addItem(ruler_rect)
-        
-        # 根据缩放级别动态调整刻度间隔
-        if self.pixels_per_second >= 100:  # 高缩放级别，显示每秒
-            major_interval = 1
-            minor_interval = 0.2
-            show_minor = True
-        elif self.pixels_per_second >= 50:  # 中等缩放级别，显示每5秒
-            major_interval = 5
-            minor_interval = 1
-            show_minor = True
-        elif self.pixels_per_second >= 20:  # 低缩放级别，显示每10秒
-            major_interval = 10
-            minor_interval = 2
-            show_minor = True
-        else:  # 很低缩放级别，显示每30秒
-            major_interval = 30
-            minor_interval = 10
-            show_minor = False
-        
-        # 绘制主刻度
-        current_time = 0
-        while current_time <= self.timeline_duration:
-            x = current_time * self.pixels_per_second
-            
-            # 主刻度线
-            line = self.scene.addLine(x, -ruler_height, x, -ruler_height + 20, 
-                                    QPen(QColor(80, 80, 80), 2))
-            line.setZValue(2)
-            
-            # 时间标签
-            minutes = int(current_time) // 60
-            seconds = int(current_time) % 60
-            if current_time >= 3600:  # 超过1小时显示小时
-                hours = int(current_time) // 3600
-                minutes = (int(current_time) % 3600) // 60
-                time_text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            else:
-                time_text = f"{minutes:02d}:{seconds:02d}"
-            
-            label = self.scene.addText(time_text, QFont("Arial", 9))
-            label.setPos(x + 3, -ruler_height + 3)
-            label.setZValue(3)
-            
-            current_time += major_interval
-        
-        # 绘制次刻度
-        if show_minor and minor_interval < major_interval:
-            current_time = 0
-            while current_time <= self.timeline_duration:
-                if current_time % major_interval != 0:  # 不与主刻度重叠
-                    x = current_time * self.pixels_per_second
-                    line = self.scene.addLine(x, -ruler_height, x, -ruler_height + 10, 
-                                            QPen(QColor(120, 120, 120), 1))
-                    line.setZValue(2)
-                current_time += minor_interval
+    # draw_time_ruler方法已移除，时间刻度条现在是独立的固定组件
     
     def draw_playhead(self):
         """绘制播放头"""
@@ -1484,39 +1620,15 @@ class TimelineWidget(QGraphicsView):
             # 重新绘制播放头
             x = self.current_time * self.pixels_per_second
             
-            # 播放头线条
+            # 播放头线条（从轨道顶部开始）
             self.playhead = self.scene.addLine(
-                x, -30, x, self.scene.height(),
+                x, 0, x, self.scene.height(),
                 QPen(QColor(255, 0, 0), 3)  # 红色播放头，加粗便于拖动
             )
             self.playhead.setZValue(15)  # 确保播放头在最上层
             self.playhead.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)  # 禁用默认拖动，使用自定义拖动逻辑
             
-            # 播放头顶部三角形（拖动手柄）
-            triangle_size = 12  # 增大三角形便于拖动
-            triangle_points = [
-                QPoint(int(x), -30),
-                QPoint(int(x - triangle_size), -30 + triangle_size),
-                QPoint(int(x + triangle_size), -30 + triangle_size)
-            ]
-            
-            from PyQt6.QtGui import QPolygonF
-            from PyQt6.QtCore import QPointF
-            triangle = QPolygonF([QPointF(p.x(), p.y()) for p in triangle_points])
-            
-            # 根据是否正在拖动设置不同的颜色
-            if hasattr(self, 'playhead_dragging') and self.playhead_dragging:
-                triangle_color = QColor(255, 100, 100)  # 拖动时更亮的红色
-                triangle_border = QColor(200, 0, 0)
-            else:
-                triangle_color = QColor(255, 0, 0)  # 正常红色
-                triangle_border = QColor(180, 0, 0)
-            
-            self.playhead_triangle = self.scene.addPolygon(triangle, QPen(triangle_border, 2), QBrush(triangle_color))
-            self.playhead_triangle.setZValue(15)  # 确保三角形在最上层
-            self.playhead_triangle.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)  # 可选择
-            self.playhead_triangle.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)  # 禁用默认拖动，使用自定义拖动逻辑
-            self.playhead_triangle.setCursor(Qt.CursorShape.OpenHandCursor)  # 设置手型光标提示可拖动
+            # 播放头三角形现在在固定的时间刻度条中显示，这里不再绘制
             
             # 添加播放头时间显示
             if hasattr(self, 'playhead_dragging') and self.playhead_dragging:
@@ -2134,8 +2246,11 @@ class TimelineWidget(QGraphicsView):
         
         # 重新绘制基础元素
         self.draw_tracks()
-        self.draw_time_ruler()
         self.draw_playhead()
+        
+        # 通知主窗口更新固定时间刻度条
+        if hasattr(self.parent(), 'timeline_ruler'):
+            self.parent().timeline_ruler.update()
         
         # 重新绘制时间范围选择
         self.draw_range_selection()
@@ -2333,13 +2448,13 @@ class TimelineWidget(QGraphicsView):
         """放大时间轴"""
         new_zoom = min(self.zoom_factor * 1.2, 5.0)  # 最大5倍缩放
         self.apply_zoom(new_zoom)
-        print(f"时间轴放大到 {new_zoom:.1f}x")
+        print(f"时间轴放大到 {new_zoom:.3f}x")
     
     def zoom_out(self):
         """缩小时间轴"""
-        new_zoom = max(self.zoom_factor / 1.2, 0.1)  # 最小0.1倍缩放
+        new_zoom = max(self.zoom_factor / 1.2, 0.001)  # 最小0.001倍缩放
         self.apply_zoom(new_zoom)
-        print(f"时间轴缩小到 {new_zoom:.1f}x")
+        print(f"时间轴缩小到 {new_zoom:.3f}x")
     
     def dragEnterEvent(self, event: QDragEnterEvent):
         # 接受来自媒体库的拖拽或文件拖拽
@@ -2565,6 +2680,481 @@ class TimelineWidget(QGraphicsView):
         # 发射剪辑变化信号
         self.clips_changed.emit()
 
+class VideoScaleController(QWidget):
+    """视频缩放控制器 - 提供9个控制点进行缩放和移动"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # 允许接收键盘事件
+        
+        # 缩放参数
+        self.scale_x = 1.0
+        self.scale_y = 1.0
+        self.offset_x = 0
+        self.offset_y = 0
+        
+        # 控制点大小
+        self.handle_size = 8
+        
+        # 拖拽状态
+        self.dragging = False
+        self.drag_handle = None
+        self.drag_start_pos = None
+        self.drag_start_scale = None
+        self.drag_start_offset = None
+        
+        # 键盘修饰键状态
+        self.shift_pressed = False
+        self.alt_pressed = False
+        self.ctrl_pressed = False
+        
+        # 控制点位置（相对于widget）
+        self.handles = {
+            'top_left': None,
+            'top_center': None,
+            'top_right': None,
+            'middle_left': None,
+            'middle_center': None,
+            'middle_right': None,
+            'bottom_left': None,
+            'bottom_center': None,
+            'bottom_right': None
+        }
+        
+        self.setMouseTracking(True)
+        self.update_handles()
+    
+    def keyPressEvent(self, event):
+        """键盘按下事件 - 处理修饰键"""
+        if event.key() == Qt.Key.Key_Shift:
+            self.shift_pressed = True
+        elif event.key() == Qt.Key.Key_Alt:
+            self.alt_pressed = True
+        elif event.key() == Qt.Key.Key_Control:
+            self.ctrl_pressed = True
+        elif event.key() == Qt.Key.Key_R and self.ctrl_pressed:
+            # Ctrl+R 重置变换
+            self.reset_transform()
+        super().keyPressEvent(event)
+    
+    def keyReleaseEvent(self, event):
+        """键盘释放事件 - 处理修饰键"""
+        if event.key() == Qt.Key.Key_Shift:
+            self.shift_pressed = False
+        elif event.key() == Qt.Key.Key_Alt:
+            self.alt_pressed = False
+        elif event.key() == Qt.Key.Key_Control:
+            self.ctrl_pressed = False
+        super().keyReleaseEvent(event)
+    
+    def update_handles(self):
+        """更新控制点位置"""
+        if not self.parent():
+            return
+            
+        parent_rect = self.parent().rect()
+        self.setGeometry(parent_rect)
+        
+        # 计算视频显示区域（考虑缩放和偏移）
+        video_width = parent_rect.width() * self.scale_x
+        video_height = parent_rect.height() * self.scale_y
+        video_x = (parent_rect.width() - video_width) / 2 + self.offset_x
+        video_y = (parent_rect.height() - video_height) / 2 + self.offset_y
+        
+        # 更新控制点位置
+        self.handles['top_left'] = QRect(int(video_x - self.handle_size//2), int(video_y - self.handle_size//2), self.handle_size, self.handle_size)
+        self.handles['top_center'] = QRect(int(video_x + video_width/2 - self.handle_size//2), int(video_y - self.handle_size//2), self.handle_size, self.handle_size)
+        self.handles['top_right'] = QRect(int(video_x + video_width - self.handle_size//2), int(video_y - self.handle_size//2), self.handle_size, self.handle_size)
+        
+        self.handles['middle_left'] = QRect(int(video_x - self.handle_size//2), int(video_y + video_height/2 - self.handle_size//2), self.handle_size, self.handle_size)
+        self.handles['middle_center'] = QRect(int(video_x + video_width/2 - self.handle_size//2), int(video_y + video_height/2 - self.handle_size//2), self.handle_size, self.handle_size)
+        self.handles['middle_right'] = QRect(int(video_x + video_width - self.handle_size//2), int(video_y + video_height/2 - self.handle_size//2), self.handle_size, self.handle_size)
+        
+        self.handles['bottom_left'] = QRect(int(video_x - self.handle_size//2), int(video_y + video_height - self.handle_size//2), self.handle_size, self.handle_size)
+        self.handles['bottom_center'] = QRect(int(video_x + video_width/2 - self.handle_size//2), int(video_y + video_height - self.handle_size//2), self.handle_size, self.handle_size)
+        self.handles['bottom_right'] = QRect(int(video_x + video_width - self.handle_size//2), int(video_y + video_height - self.handle_size//2), self.handle_size, self.handle_size)
+        
+        self.update()
+    
+    def paintEvent(self, event):
+        """绘制控制点和边框 - 改进的视觉效果"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        if not self.parent():
+            return
+            
+        parent_rect = self.parent().rect()
+        
+        # 计算视频显示区域
+        video_width = parent_rect.width() * self.scale_x
+        video_height = parent_rect.height() * self.scale_y
+        video_x = (parent_rect.width() - video_width) / 2 + self.offset_x
+        video_y = (parent_rect.height() - video_height) / 2 + self.offset_y
+        
+        video_rect = QRect(int(video_x), int(video_y), int(video_width), int(video_height))
+        
+        # 绘制主边框 - 支持高亮动画
+        if hasattr(self, 'highlight_animation') and self.highlight_animation:
+            # 高亮状态：使用亮黄色边框
+            painter.setPen(QPen(QColor(255, 193, 7), 3, Qt.PenStyle.SolidLine))
+        elif self.dragging:
+            painter.setPen(QPen(QColor(100, 181, 246), 2, Qt.PenStyle.SolidLine))
+        else:
+            painter.setPen(QPen(QColor(255, 255, 255, 180), 1, Qt.PenStyle.DashLine))
+        painter.drawRect(video_rect)
+        
+        # 绘制三等分线（类似Photoshop的网格）
+        if self.dragging or (hasattr(self, 'highlight_animation') and self.highlight_animation):
+            painter.setPen(QPen(QColor(255, 255, 255, 100), 1, Qt.PenStyle.DashLine))
+            # 垂直三等分线
+            third_width = video_width / 3
+            painter.drawLine(int(video_x + third_width), int(video_y), 
+                           int(video_x + third_width), int(video_y + video_height))
+            painter.drawLine(int(video_x + 2 * third_width), int(video_y), 
+                           int(video_x + 2 * third_width), int(video_y + video_height))
+            # 水平三等分线
+            third_height = video_height / 3
+            painter.drawLine(int(video_x), int(video_y + third_height), 
+                           int(video_x + video_width), int(video_y + third_height))
+            painter.drawLine(int(video_x), int(video_y + 2 * third_height), 
+                           int(video_x + video_width), int(video_y + 2 * third_height))
+        
+        # 绘制变换信息显示
+        if self.dragging or (hasattr(self, 'highlight_animation') and self.highlight_animation):
+            info_text = f"缩放: {self.scale_x:.1f}x{self.scale_y:.1f}  偏移: ({self.offset_x:.0f}, {self.offset_y:.0f})"
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
+            
+            # 计算文本区域
+            font_metrics = painter.fontMetrics()
+            text_rect = font_metrics.boundingRect(info_text)
+            text_rect.adjust(-5, -2, 5, 2)
+            text_rect.moveTo(10, 10)
+            
+            # 绘制背景和文本
+            painter.drawRect(text_rect)
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.drawText(text_rect.adjusted(5, 2, -5, -2), Qt.AlignmentFlag.AlignLeft, info_text)
+        
+        # 绘制控制点
+        for handle_name, handle_rect in self.handles.items():
+            if handle_rect:
+                # 确定控制点颜色和样式
+                is_highlighted = hasattr(self, 'highlight_animation') and self.highlight_animation
+                is_dragging_this = self.dragging and self.drag_handle == handle_name
+                
+                # 根据控制点类型使用不同样式
+                if handle_name in ['top_left', 'top_right', 'bottom_left', 'bottom_right']:
+                    # 角点：方形
+                    if is_dragging_this:
+                        painter.setPen(QPen(QColor(255, 193, 7), 3))
+                        painter.setBrush(QBrush(QColor(255, 193, 7, 150)))
+                    elif is_highlighted:
+                        painter.setPen(QPen(QColor(255, 193, 7), 2))
+                        painter.setBrush(QBrush(QColor(255, 193, 7, 100)))
+                    else:
+                        painter.setPen(QPen(QColor(255, 255, 255), 2))
+                        painter.setBrush(QBrush(QColor(100, 181, 246)))
+                    painter.drawRect(handle_rect)
+                elif handle_name == 'middle_center':
+                    # 中心点：圆形，特殊颜色
+                    if is_dragging_this:
+                        painter.setPen(QPen(QColor(255, 193, 7), 3))
+                        painter.setBrush(QBrush(QColor(255, 193, 7, 150)))
+                    elif is_highlighted:
+                        painter.setPen(QPen(QColor(255, 193, 7), 2))
+                        painter.setBrush(QBrush(QColor(255, 193, 7, 100)))
+                    else:
+                        painter.setPen(QPen(QColor(255, 255, 255), 2))
+                        painter.setBrush(QBrush(QColor(76, 175, 80)))
+                    painter.drawEllipse(handle_rect)
+                else:
+                    # 边中点：圆形
+                    if is_dragging_this:
+                        painter.setPen(QPen(QColor(255, 193, 7), 3))
+                        painter.setBrush(QBrush(QColor(255, 193, 7, 150)))
+                    elif is_highlighted:
+                        painter.setPen(QPen(QColor(255, 193, 7), 2))
+                        painter.setBrush(QBrush(QColor(255, 193, 7, 100)))
+                    else:
+                        painter.setPen(QPen(QColor(255, 255, 255), 2))
+                        painter.setBrush(QBrush(QColor(100, 181, 246)))
+                    painter.drawEllipse(handle_rect)
+    
+    def mousePressEvent(self, event):
+        """鼠标按下事件"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 记录点击时间，用于检测双击
+            current_time = time.time()
+            if hasattr(self, 'last_click_time'):
+                if current_time - self.last_click_time < 0.5:  # 500ms内的点击视为双击
+                    self.handle_double_click(event)
+                    return
+            self.last_click_time = current_time
+            
+            # 检查是否点击了控制点
+            for handle_name, handle_rect in self.handles.items():
+                if handle_rect and handle_rect.contains(event.position().toPoint()):
+                    self.dragging = True
+                    self.drag_handle = handle_name
+                    self.drag_start_pos = event.position().toPoint()
+                    self.drag_start_scale = (self.scale_x, self.scale_y)
+                    self.drag_start_offset = (self.offset_x, self.offset_y)
+                    self.setCursor(self.get_cursor_for_handle(handle_name))
+                    return
+            
+            # 检查是否点击了视频区域（用于移动）
+            parent_rect = self.parent().rect()
+            video_width = parent_rect.width() * self.scale_x
+            video_height = parent_rect.height() * self.scale_y
+            video_x = (parent_rect.width() - video_width) / 2 + self.offset_x
+            video_y = (parent_rect.height() - video_height) / 2 + self.offset_y
+            video_rect = QRect(int(video_x), int(video_y), int(video_width), int(video_height))
+            
+            if video_rect.contains(event.position().toPoint()):
+                self.dragging = True
+                self.drag_handle = 'move'
+                self.drag_start_pos = event.position().toPoint()
+                self.drag_start_offset = (self.offset_x, self.offset_y)
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+    
+    def handle_double_click(self, event):
+        """处理双击事件 - 退出变换模式"""
+        # 获取VideoPreviewWidget实例
+        video_container = self.parent()
+        if video_container:
+            preview_widget = video_container.parent()
+            if preview_widget and hasattr(preview_widget, 'transform_btn'):
+                # 退出变换模式
+                preview_widget.transform_btn.setChecked(False)
+                preview_widget.toggle_transform_mode()
+                print("[DEBUG] 双击退出变换模式")
+    
+    def mouseMoveEvent(self, event):
+        """鼠标移动事件"""
+        if self.dragging and self.drag_handle:
+            current_pos = event.position().toPoint()
+            delta_x = current_pos.x() - self.drag_start_pos.x()
+            delta_y = current_pos.y() - self.drag_start_pos.y()
+            
+            if self.drag_handle == 'move':
+                # 移动视频
+                self.offset_x = self.drag_start_offset[0] + delta_x
+                self.offset_y = self.drag_start_offset[1] + delta_y
+            else:
+                # 缩放视频
+                self.handle_scale_drag(delta_x, delta_y)
+            
+            self.update_handles()
+            self.apply_transform()
+        else:
+            # 更新鼠标光标
+            cursor = Qt.CursorShape.ArrowCursor
+            for handle_name, handle_rect in self.handles.items():
+                if handle_rect and handle_rect.contains(event.position().toPoint()):
+                    cursor = self.get_cursor_for_handle(handle_name)
+                    break
+            self.setCursor(cursor)
+    
+    def mouseReleaseEvent(self, event):
+        """鼠标释放事件"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.dragging = False
+            self.drag_handle = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+    
+    def handle_scale_drag(self, delta_x, delta_y):
+        """处理缩放拖拽 - 改进的9点缩放逻辑，支持修饰键"""
+        if not self.parent():
+            return
+            
+        parent_rect = self.parent().rect()
+        
+        # 计算原始视频区域
+        orig_video_width = parent_rect.width() * self.drag_start_scale[0]
+        orig_video_height = parent_rect.height() * self.drag_start_scale[1]
+        orig_video_x = (parent_rect.width() - orig_video_width) / 2 + self.drag_start_offset[0]
+        orig_video_y = (parent_rect.height() - orig_video_height) / 2 + self.drag_start_offset[1]
+        
+        # 计算新的尺寸
+        new_width = orig_video_width
+        new_height = orig_video_height
+        
+        # 根据不同的控制点实现不同的缩放逻辑
+        if self.drag_handle == 'top_left':
+            new_width = max(20, orig_video_width - delta_x)
+            new_height = max(20, orig_video_height - delta_y)
+        elif self.drag_handle == 'top_right':
+            new_width = max(20, orig_video_width + delta_x)
+            new_height = max(20, orig_video_height - delta_y)
+        elif self.drag_handle == 'bottom_left':
+            new_width = max(20, orig_video_width - delta_x)
+            new_height = max(20, orig_video_height + delta_y)
+        elif self.drag_handle == 'bottom_right':
+            new_width = max(20, orig_video_width + delta_x)
+            new_height = max(20, orig_video_height + delta_y)
+        elif self.drag_handle in ['middle_left', 'middle_right']:
+            # 水平缩放
+            if self.drag_handle == 'middle_left':
+                new_width = max(20, orig_video_width - delta_x)
+            else:
+                new_width = max(20, orig_video_width + delta_x)
+            new_height = orig_video_height  # 保持高度不变
+        elif self.drag_handle in ['top_center', 'bottom_center']:
+            # 垂直缩放
+            if self.drag_handle == 'top_center':
+                new_height = max(20, orig_video_height - delta_y)
+            else:
+                new_height = max(20, orig_video_height + delta_y)
+            new_width = orig_video_width  # 保持宽度不变
+        elif self.drag_handle == 'middle_center':
+            # 中心点：等比例缩放
+            scale_factor = 1.0 + (delta_x + delta_y) * 0.005
+            new_width = max(20, orig_video_width * scale_factor)
+            new_height = max(20, orig_video_height * scale_factor)
+        
+        # 应用修饰键效果
+        if self.shift_pressed and self.drag_handle in ['top_left', 'top_right', 'bottom_left', 'bottom_right']:
+            # Shift键：保持宽高比（角点缩放时）
+            aspect_ratio = orig_video_width / orig_video_height
+            if abs(delta_x) > abs(delta_y):
+                new_height = new_width / aspect_ratio
+            else:
+                new_width = new_height * aspect_ratio
+        
+        # 限制缩放范围
+        self.scale_x = max(0.1, min(3.0, new_width / parent_rect.width()))
+        self.scale_y = max(0.1, min(3.0, new_height / parent_rect.height()))
+        
+        # 计算偏移调整
+        if self.alt_pressed:
+            # Alt键：从中心缩放
+            width_diff = new_width - orig_video_width
+            height_diff = new_height - orig_video_height
+            self.offset_x = self.drag_start_offset[0] - width_diff / 2
+            self.offset_y = self.drag_start_offset[1] - height_diff / 2
+        else:
+            # 正常缩放：固定对应的角或边
+            if self.drag_handle in ['top_left', 'middle_left', 'bottom_left']:
+                # 固定右边
+                self.offset_x = self.drag_start_offset[0] + (orig_video_width - new_width)
+            elif self.drag_handle in ['top_right', 'middle_right', 'bottom_right']:
+                # 固定左边
+                self.offset_x = self.drag_start_offset[0]
+            else:
+                # 中心对齐
+                width_diff = new_width - orig_video_width
+                self.offset_x = self.drag_start_offset[0] - width_diff / 2
+            
+            if self.drag_handle in ['top_left', 'top_center', 'top_right']:
+                # 固定下边
+                self.offset_y = self.drag_start_offset[1] + (orig_video_height - new_height)
+            elif self.drag_handle in ['bottom_left', 'bottom_center', 'bottom_right']:
+                # 固定上边
+                self.offset_y = self.drag_start_offset[1]
+            else:
+                # 中心对齐
+                height_diff = new_height - orig_video_height
+                self.offset_y = self.drag_start_offset[1] - height_diff / 2
+    
+    def get_cursor_for_handle(self, handle_name):
+        """获取控制点对应的鼠标光标"""
+        cursor_map = {
+            'top_left': Qt.CursorShape.SizeFDiagCursor,
+            'top_center': Qt.CursorShape.SizeVerCursor,
+            'top_right': Qt.CursorShape.SizeBDiagCursor,
+            'middle_left': Qt.CursorShape.SizeHorCursor,
+            'middle_center': Qt.CursorShape.SizeAllCursor,
+            'middle_right': Qt.CursorShape.SizeHorCursor,
+            'bottom_left': Qt.CursorShape.SizeBDiagCursor,
+            'bottom_center': Qt.CursorShape.SizeVerCursor,
+            'bottom_right': Qt.CursorShape.SizeFDiagCursor
+        }
+        return cursor_map.get(handle_name, Qt.CursorShape.ArrowCursor)
+    
+    def apply_transform(self):
+        """应用变换到视频组件 - 改进的实时渲染"""
+        # 获取VideoPreviewWidget实例 - 修复路径查找逻辑
+        video_container = self.parent()  # 直接父组件是video_container
+        if not video_container:
+            return
+            
+        preview_widget = video_container.parent()  # video_container的父组件是VideoPreviewWidget
+        if not preview_widget or not hasattr(preview_widget, 'video_widget'):
+            return
+            
+        video_widget = preview_widget.video_widget
+        parent_rect = video_container.rect()  # 使用video_container的尺寸
+        
+        # 计算变换后的视频区域
+        video_width = parent_rect.width() * self.scale_x
+        video_height = parent_rect.height() * self.scale_y
+        video_x = (parent_rect.width() - video_width) / 2 + self.offset_x
+        video_y = (parent_rect.height() - video_height) / 2 + self.offset_y
+        
+        # 应用几何变换到视频组件
+        video_widget.setGeometry(int(video_x), int(video_y), int(video_width), int(video_height))
+        
+        # 添加视觉效果：边框高亮
+        if self.dragging:
+            video_widget.setStyleSheet("""
+                QVideoWidget {
+                    border: 2px solid #64B5F6;
+                    border-radius: 4px;
+                }
+            """)
+        else:
+            video_widget.setStyleSheet("""
+                QVideoWidget {
+                    border: 1px solid rgba(255, 255, 255, 0.3);
+                    border-radius: 2px;
+                }
+            """)
+        
+        print(f"[DEBUG] 应用变换: scale=({self.scale_x:.2f}, {self.scale_y:.2f}), offset=({self.offset_x:.0f}, {self.offset_y:.0f}), video_rect=({video_x:.0f}, {video_y:.0f}, {video_width:.0f}, {video_height:.0f})")
+    
+    def reset_transform(self):
+        """重置变换"""
+        self.scale_x = 1.0
+        self.scale_y = 1.0
+        self.offset_x = 0
+        self.offset_y = 0
+        self.update_handles()
+        self.apply_transform()
+    
+    def highlight_for_attention(self):
+        """高亮显示缩放控制器以吸引注意"""
+        # 创建高亮动画效果
+        self.highlight_animation = True
+        self.highlight_timer = QTimer()
+        self.highlight_timer.timeout.connect(self.toggle_highlight)
+        self.highlight_timer.start(500)  # 每500ms切换一次高亮状态
+        
+        # 3秒后停止高亮
+        QTimer.singleShot(3000, self.stop_highlight)
+        
+        # 立即更新显示
+        self.update()
+    
+    def toggle_highlight(self):
+        """切换高亮状态"""
+        if hasattr(self, 'highlight_animation'):
+            self.highlight_animation = not self.highlight_animation
+            self.update()
+    
+    def stop_highlight(self):
+        """停止高亮动画"""
+        if hasattr(self, 'highlight_timer'):
+            self.highlight_timer.stop()
+            delattr(self, 'highlight_timer')
+        if hasattr(self, 'highlight_animation'):
+            delattr(self, 'highlight_animation')
+        self.update()
+
+
 class VideoPreviewWidget(QWidget):
     """视频预览组件"""
     
@@ -2584,6 +3174,9 @@ class VideoPreviewWidget(QWidget):
         # 渲染显示组件
         self.rendered_frame_label = None
         
+        # 视频缩放控制器
+        self.scale_controller = VideoScaleController()
+        
         self.setup_ui()
         
         # 连接渲染引擎信号
@@ -2593,27 +3186,90 @@ class VideoPreviewWidget(QWidget):
     def setup_ui(self):
         layout = QVBoxLayout(self)
         
+        # 预览设置控制栏
+        settings_layout = QHBoxLayout()
+        
+        # 分辨率选择
+        resolution_label = QLabel("输出分辨率:")
+        settings_layout.addWidget(resolution_label)
+        
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.addItems([
+            "1920x1080 (1080p)",
+            "1280x720 (720p)", 
+            "854x480 (480p)",
+            "640x360 (360p)",
+            "3840x2160 (4K)",
+            "2560x1440 (1440p)"
+        ])
+        self.resolution_combo.setCurrentText("1280x720 (720p)")  # 默认720p
+        self.resolution_combo.currentTextChanged.connect(self.on_resolution_changed)
+        settings_layout.addWidget(self.resolution_combo)
+        
+        settings_layout.addStretch()
+        
+        # 预览缩放控制
+        zoom_label = QLabel("预览缩放:")
+        settings_layout.addWidget(zoom_label)
+        
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(25, 200)  # 25% 到 200%
+        self.zoom_slider.setValue(100)  # 默认100%
+        self.zoom_slider.setFixedWidth(100)
+        self.zoom_slider.valueChanged.connect(self.on_zoom_changed)
+        settings_layout.addWidget(self.zoom_slider)
+        
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setFixedWidth(40)
+        settings_layout.addWidget(self.zoom_label)
+        
+        # 视频变换控制
+        self.transform_btn = QPushButton("🎯")
+        self.transform_btn.setToolTip("启用视频变换控制（缩放/移动）")
+        self.transform_btn.setFixedSize(30, 30)
+        self.transform_btn.setCheckable(True)
+        self.transform_btn.clicked.connect(self.toggle_transform_mode)
+        settings_layout.addWidget(self.transform_btn)
+        
+        self.reset_transform_btn = QPushButton("↺")
+        self.reset_transform_btn.setToolTip("重置视频变换")
+        self.reset_transform_btn.setFixedSize(30, 30)
+        self.reset_transform_btn.clicked.connect(self.reset_video_transform)
+        settings_layout.addWidget(self.reset_transform_btn)
+        
+        layout.addLayout(settings_layout)
+        
         # 视频显示区域容器
-        video_container = QWidget()
-        video_layout = QVBoxLayout(video_container)
+        self.video_container = QWidget()
+        video_layout = QVBoxLayout(self.video_container)
         video_layout.setContentsMargins(0, 0, 0, 0)
         
         # 原始视频播放器
         self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumSize(400, 300)
+        self.video_widget.setMinimumSize(320, 240)  # 降低最小尺寸限制
         self.video_widget.setStyleSheet("background-color: #2b2b2b; border: 1px solid #555;")
+        # 设置视频保持原始比例，不拉伸
+        self.video_widget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+        # 为视频组件添加双击事件处理
+        self.video_widget.mouseDoubleClickEvent = self.on_video_double_click
         video_layout.addWidget(self.video_widget)
         
         # 渲染帧显示标签（用于时间轴渲染模式）
         self.rendered_frame_label = QLabel()
-        self.rendered_frame_label.setMinimumSize(400, 300)
+        self.rendered_frame_label.setMinimumSize(320, 240)  # 降低最小尺寸限制
         self.rendered_frame_label.setStyleSheet("background-color: #2b2b2b; border: 1px solid #555;")
         self.rendered_frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.rendered_frame_label.setScaledContents(True)
+        # 不设置setScaledContents(True)，保持原始比例
+        # 为渲染帧标签添加双击事件处理
+        self.rendered_frame_label.mouseDoubleClickEvent = self.on_video_double_click
         self.rendered_frame_label.hide()  # 默认隐藏
         video_layout.addWidget(self.rendered_frame_label)
         
-        layout.addWidget(video_container)
+        # 初始化缩放控制器并设置为视频容器的子组件
+        self.scale_controller.setParent(self.video_container)
+        self.scale_controller.hide()  # 默认隐藏
+        
+        layout.addWidget(self.video_container)
         
         # 播放控制
         controls = QHBoxLayout()
@@ -2919,8 +3575,26 @@ class VideoPreviewWidget(QWidget):
     def display_rendered_frame(self, pixmap: QPixmap):
         """显示渲染完成的帧"""
         if self.timeline_mode and self.rendered_frame_label:
-            self.rendered_frame_label.setPixmap(pixmap)
-            print(f"[DEBUG] 显示渲染帧: {pixmap.width()}x{pixmap.height()}")
+            # 获取标签的实际大小
+            label_size = self.rendered_frame_label.size()
+            
+            # 如果启用自动分辨率，更新渲染器分辨率以匹配显示大小
+            if self.timeline_renderer.auto_resolution:
+                # 使用较高的分辨率以保证画质，但不超过原始分辨率
+                target_width = min(label_size.width() * 2, 1920)
+                target_height = min(label_size.height() * 2, 1080)
+                if (target_width, target_height) != self.timeline_renderer.resolution:
+                    self.timeline_renderer.set_resolution(target_width, target_height)
+            
+            # 使用高质量缩放算法
+            scaled_pixmap = pixmap.scaled(
+                label_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            
+            self.rendered_frame_label.setPixmap(scaled_pixmap)
+            print(f"[DEBUG] 显示渲染帧: {pixmap.width()}x{pixmap.height()} -> {scaled_pixmap.width()}x{scaled_pixmap.height()}")
     
     def handle_render_error(self, error_message: str):
         """处理渲染错误"""
@@ -2939,6 +3613,159 @@ class VideoPreviewWidget(QWidget):
             painter.end()
             
             self.rendered_frame_label.setPixmap(error_pixmap)
+    
+    def on_resolution_changed(self, resolution_text):
+        """分辨率改变时的回调"""
+        # 解析分辨率文本，提取宽度和高度
+        resolution_map = {
+            "1920x1080 (1080p)": (1920, 1080),
+            "1280x720 (720p)": (1280, 720),
+            "854x480 (480p)": (854, 480),
+            "640x360 (360p)": (640, 360),
+            "3840x2160 (4K)": (3840, 2160),
+            "2560x1440 (1440p)": (2560, 1440)
+        }
+        
+        if resolution_text in resolution_map:
+            new_resolution = resolution_map[resolution_text]
+            # 更新TimelineRenderer的分辨率
+            if hasattr(self, 'timeline_renderer'):
+                self.timeline_renderer.set_resolution(new_resolution[0], new_resolution[1])
+                print(f"输出分辨率已更改为: {new_resolution[0]}x{new_resolution[1]}")
+                
+                # 同步调整预览框大小比例
+                if self.timeline_mode and self.rendered_frame_label:
+                    # 计算新的宽高比
+                    aspect_ratio = new_resolution[0] / new_resolution[1]
+                    
+                    # 获取当前预览框的大小
+                    current_size = self.rendered_frame_label.size()
+                    
+                    # 根据宽高比调整预览框尺寸，保持合适的显示大小
+                    if aspect_ratio > 1:  # 宽屏
+                        new_width = min(current_size.width(), 640)
+                        new_height = int(new_width / aspect_ratio)
+                    else:  # 竖屏或方形
+                        new_height = min(current_size.height(), 480)
+                        new_width = int(new_height * aspect_ratio)
+                    
+                    # 设置预览框的最小尺寸以保持比例
+                    self.rendered_frame_label.setMinimumSize(new_width, new_height)
+                    self.rendered_frame_label.setMaximumSize(new_width * 2, new_height * 2)
+                    
+                    print(f"预览框尺寸已调整为: {new_width}x{new_height} (比例: {aspect_ratio:.2f})")
+    
+    def on_zoom_changed(self, zoom_value):
+        """预览缩放改变时的回调"""
+        self.zoom_label.setText(f"{zoom_value}%")
+        
+        # 计算缩放比例
+        scale_factor = zoom_value / 100.0
+        
+        # 应用缩放到视频容器
+        if hasattr(self, 'video_container'):
+            # 使用QGraphicsEffect实现缩放
+            from PyQt6.QtWidgets import QGraphicsEffect
+            from PyQt6.QtCore import QPropertyAnimation, QEasingCurve
+            
+            # 简单的样式表缩放（备用方案）
+            transform = f"scale({scale_factor})"
+            self.video_container.setStyleSheet(f"QWidget {{ transform: {transform}; }}")
+            
+        print(f"预览缩放已更改为: {zoom_value}%")
+    
+    def toggle_transform_mode(self):
+        """切换视频变换模式"""
+        if self.transform_btn.isChecked():
+            # 启用变换模式
+            self.scale_controller.show()
+            self.scale_controller.resize(self.video_container.size())
+            print("视频变换模式已启用")
+        else:
+            # 禁用变换模式
+            self.scale_controller.hide()
+            print("视频变换模式已禁用")
+    
+    def reset_video_transform(self):
+        """重置视频变换"""
+        if hasattr(self, 'scale_controller'):
+            self.scale_controller.reset_transform()
+            print("视频变换已重置")
+    
+    def show_transform_tips(self):
+        """显示变换操作提示信息"""
+        tips_text = (
+            "缩放和移动操作提示:\n\n"
+            "• 拖拽四角控制点：自由缩放\n"
+            "• 拖拽边中点：单向缩放\n"
+            "• 拖拽中心点：等比例缩放\n"
+            "• 拖拽视频区域：移动位置\n\n"
+            "快捷键:\n"
+            "• Shift + 拖拽角点：保持宽高比\n"
+            "• Alt + 拖拽：从中心缩放\n"
+            "• Ctrl + R：重置变换\n"
+            "• 双击：退出变换模式"
+        )
+        
+        # 创建提示对话框
+        from PyQt6.QtWidgets import QMessageBox
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("变换模式已激活")
+        msg_box.setText(tips_text)
+        msg_box.setIcon(QMessageBox.Icon.Information)
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        
+        # 设置对话框样式
+        msg_box.setStyleSheet("""
+            QMessageBox {
+                background-color: #2b2b2b;
+                color: #ffffff;
+                font-size: 12px;
+            }
+            QMessageBox QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                min-width: 80px;
+            }
+            QMessageBox QPushButton:hover {
+                background-color: #106ebe;
+            }
+        """)
+        
+        # 3秒后自动关闭
+        QTimer.singleShot(3000, msg_box.accept)
+        msg_box.show()
+    
+    def on_video_double_click(self, event):
+        """视频区域双击事件处理 - 改进的缩放和移动界面"""
+        # 检查是否有媒体正在播放或已加载
+        if self.current_media or (self.timeline_mode and self.timeline_widget and self.timeline_widget.clips):
+            # 自动启用变换模式
+            if not self.transform_btn.isChecked():
+                self.transform_btn.setChecked(True)
+                self.toggle_transform_mode()
+                print("[DEBUG] 双击视频区域，自动启用变换模式")
+            
+            # 显示变换提示信息
+            self.show_transform_tips()
+            
+            # 高亮显示缩放控制器
+            self.scale_controller.highlight_for_attention()
+            
+            print("[DEBUG] 双击激活缩放和移动界面")
+        else:
+            print("[DEBUG] 没有媒体内容，无法启用变换模式")
+    
+    def resizeEvent(self, event):
+        """窗口大小改变事件"""
+        super().resizeEvent(event)
+        
+        # 同步缩放控制器的大小
+        if hasattr(self, 'scale_controller') and hasattr(self, 'video_container'):
+            self.scale_controller.resize(self.video_container.size())
     
     def get_timeline_duration(self) -> float:
         """获取时间轴总时长"""
@@ -3010,18 +3837,23 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # 主布局
-        main_layout = QHBoxLayout(central_widget)
+        # 主布局 - 使用简单的布局容器
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 创建主分割器（水平分割）
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
         
         # 左侧面板 (媒体库)
         left_panel = QWidget()
-        left_panel.setFixedWidth(300)
+        left_panel.setMinimumWidth(200)
+        left_panel.setMaximumWidth(600)
         left_layout = QVBoxLayout(left_panel)
         
         self.media_library = MediaLibraryWidget()
         left_layout.addWidget(self.media_library)
         
-        main_layout.addWidget(left_panel)
+        main_splitter.addWidget(left_panel)
         
         # 中央区域
         center_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -3042,15 +3874,30 @@ class MainWindow(QMainWindow):
         self.timeline_toolbar = TimelineToolbar()
         timeline_layout.addWidget(self.timeline_toolbar)
         
-        # 时间轴组件
+        # 创建时间轴主体容器，包含固定的时间刻度条和可滚动的轨道区域
+        timeline_main_container = QWidget()
+        timeline_main_layout = QVBoxLayout(timeline_main_container)
+        timeline_main_layout.setContentsMargins(0, 0, 0, 0)
+        timeline_main_layout.setSpacing(0)
+        
+        # 固定的时间刻度条
+        self.timeline_ruler = TimelineRulerWidget()
+        timeline_main_layout.addWidget(self.timeline_ruler)
+        
+        # 时间轴组件（不包含时间刻度条）
         self.timeline = TimelineWidget()
-        timeline_layout.addWidget(self.timeline)
+        timeline_main_layout.addWidget(self.timeline)
+        
+        timeline_layout.addWidget(timeline_main_container)
         
         # 连接时间轴工具栏信号
         self.setup_timeline_toolbar_connections()
         
         # 建立视频预览和时间轴的连接
         self.video_preview.timeline_widget = self.timeline
+        
+        # 连接时间轴和固定刻度条的同步
+        self.setup_timeline_ruler_sync()
         
         # 连接视频预览器的播放状态变化信号到工具栏更新
         self.video_preview.media_player.playbackStateChanged.connect(self.update_toolbar_play_button)
@@ -3065,11 +3912,12 @@ class MainWindow(QMainWindow):
         center_splitter.addWidget(timeline_container)
         center_splitter.setSizes([400, 300])
         
-        main_layout.addWidget(center_splitter)
+        main_splitter.addWidget(center_splitter)
         
         # 右侧面板 (属性)
         right_panel = QWidget()
-        right_panel.setFixedWidth(250)
+        right_panel.setMinimumWidth(180)
+        right_panel.setMaximumWidth(500)
         right_layout = QVBoxLayout(right_panel)
         
         properties_label = QLabel("属性")
@@ -3105,7 +3953,54 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.properties_widget)
         right_layout.addStretch()
         
-        main_layout.addWidget(right_panel)
+        main_splitter.addWidget(right_panel)
+        
+        # 设置主分割器的初始大小比例和拉伸因子
+        main_splitter.setSizes([280, 800, 220])  # 左侧280px，中央800px，右侧220px
+        main_splitter.setStretchFactor(0, 0)  # 左侧面板不自动拉伸
+        main_splitter.setStretchFactor(1, 1)  # 中央区域可拉伸
+        main_splitter.setStretchFactor(2, 0)  # 右侧面板不自动拉伸
+        
+        # 设置分割器样式，让分割线更明显
+        main_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #555555;
+                width: 3px;
+                margin: 1px;
+            }
+            QSplitter::handle:hover {
+                background-color: #777777;
+            }
+        """)
+        
+        main_layout.addWidget(main_splitter)
+    
+    def setup_timeline_ruler_sync(self):
+        """设置时间轴和固定刻度条的同步"""
+        # 初始化刻度条参数
+        self.timeline_ruler.set_timeline_params(
+            self.timeline.pixels_per_second,
+            self.timeline.timeline_duration,
+            self.timeline.current_time
+        )
+        
+        # 连接时间轴变化信号到刻度条更新
+        self.timeline.playhead_position_changed.connect(
+            lambda time: self.timeline_ruler.set_timeline_params(
+                self.timeline.pixels_per_second,
+                self.timeline.timeline_duration,
+                time
+            )
+        )
+        
+        # 连接缩放变化信号
+        self.timeline_toolbar.zoomChanged.connect(
+            lambda: self.timeline_ruler.set_timeline_params(
+                self.timeline.pixels_per_second,
+                self.timeline.timeline_duration,
+                self.timeline.current_time
+            )
+        )
     
     def setup_timeline_toolbar_connections(self):
         """连接时间轴工具栏信号"""
