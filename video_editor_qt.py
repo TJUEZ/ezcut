@@ -25,6 +25,7 @@ from typing import List, Dict, Optional, Tuple
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 # PyQt6 imports
 try:
@@ -88,6 +89,15 @@ try:
 except ImportError:
     print("Pillow 未安装，图像处理功能将受限")
     PIL_AVAILABLE = False
+
+# 播放头控制器
+try:
+    from playhead_controller import playhead_controller
+    PLAYHEAD_CONTROLLER_AVAILABLE = True
+except ImportError:
+    print("播放头控制器未找到")
+    PLAYHEAD_CONTROLLER_AVAILABLE = False
+    playhead_controller = None
 
 class MediaItem:
     """媒体项目类"""
@@ -320,6 +330,240 @@ class TimelineClip:
             self.duration = new_duration
             self.out_point = self.in_point + new_duration
 
+class TimelineRenderer(QObject):
+    """时间轴实时渲染引擎"""
+    
+    # 信号定义
+    frameReady = pyqtSignal(QPixmap)  # 渲染完成的帧
+    renderError = pyqtSignal(str)     # 渲染错误
+    
+    def __init__(self):
+        super().__init__()
+        self.clips: List[TimelineClip] = []
+        self.current_time = 0.0
+        self.fps = 30.0
+        self.resolution = (1920, 1080)
+        self.is_rendering = False
+        
+        # 渲染缓存
+        self.frame_cache = {}
+        self.cache_size_limit = 100  # 最多缓存100帧
+        
+        # 线程池用于异步渲染
+        self.thread_pool = ThreadPoolExecutor(max_workers=2)
+        
+        # OpenCV相关
+        self.cv2_available = CV2_AVAILABLE
+        
+    def set_clips(self, clips: List[TimelineClip]):
+        """设置时间轴剪辑列表"""
+        self.clips = clips
+        self.clear_cache()
+        
+    def set_resolution(self, width: int, height: int):
+        """设置输出分辨率"""
+        self.resolution = (width, height)
+        self.clear_cache()
+        
+    def clear_cache(self):
+        """清空帧缓存"""
+        self.frame_cache.clear()
+        
+    def render_frame_at_time(self, time_seconds: float):
+        """渲染指定时间点的帧"""
+        if self.is_rendering:
+            return
+            
+        self.current_time = time_seconds
+        
+        # 检查缓存
+        cache_key = f"{time_seconds:.3f}"
+        if cache_key in self.frame_cache:
+            self.frameReady.emit(self.frame_cache[cache_key])
+            return
+            
+        # 异步渲染
+        self.is_rendering = True
+        future = self.thread_pool.submit(self._render_frame_sync, time_seconds)
+        
+        # 使用QTimer来检查渲染结果
+        self._check_render_result(future, cache_key)
+        
+    def _check_render_result(self, future, cache_key):
+        """检查渲染结果"""
+        def check():
+            if future.done():
+                try:
+                    pixmap = future.result()
+                    if pixmap:
+                        # 添加到缓存
+                        if len(self.frame_cache) >= self.cache_size_limit:
+                            # 移除最旧的缓存项
+                            oldest_key = next(iter(self.frame_cache))
+                            del self.frame_cache[oldest_key]
+                        
+                        self.frame_cache[cache_key] = pixmap
+                        self.frameReady.emit(pixmap)
+                    else:
+                        self.renderError.emit("渲染失败")
+                except Exception as e:
+                    self.renderError.emit(f"渲染错误: {str(e)}")
+                finally:
+                    self.is_rendering = False
+            else:
+                # 继续检查
+                QTimer.singleShot(10, check)
+                
+        check()
+        
+    def _render_frame_sync(self, time_seconds: float) -> Optional[QPixmap]:
+        """同步渲染帧（在线程中执行）"""
+        try:
+            # 找到当前时间点的活动剪辑
+            active_clips = self._get_active_clips_at_time(time_seconds)
+            
+            if not active_clips:
+                # 没有活动剪辑，返回黑色帧
+                return self._create_black_frame()
+                
+            # 按轨道排序（轨道号越大越在上层）
+            active_clips.sort(key=lambda c: c.track)
+            
+            # 渲染合成帧
+            return self._composite_clips(active_clips, time_seconds)
+            
+        except Exception as e:
+            print(f"渲染帧时出错: {e}")
+            return None
+            
+    def _get_active_clips_at_time(self, time_seconds: float) -> List[TimelineClip]:
+        """获取指定时间点的活动剪辑"""
+        active_clips = []
+        for clip in self.clips:
+            if clip.start_time <= time_seconds < clip.end_time:
+                active_clips.append(clip)
+        return active_clips
+        
+    def _composite_clips(self, clips: List[TimelineClip], time_seconds: float) -> Optional[QPixmap]:
+        """合成多个剪辑"""
+        if not self.cv2_available:
+            # 如果OpenCV不可用，使用简化渲染
+            return self._simple_render(clips, time_seconds)
+            
+        try:
+            # 创建输出画布
+            canvas = np.zeros((self.resolution[1], self.resolution[0], 3), dtype=np.uint8)
+            
+            for clip in clips:
+                # 计算剪辑内的相对时间
+                clip_time = time_seconds - clip.start_time + clip.in_point
+                
+                # 渲染剪辑帧
+                clip_frame = self._render_clip_frame(clip, clip_time)
+                if clip_frame is not None:
+                    # 合成到画布上
+                    canvas = self._blend_frame(canvas, clip_frame, clip.track)
+                    
+            # 转换为QPixmap
+            return self._numpy_to_qpixmap(canvas)
+            
+        except Exception as e:
+            print(f"合成剪辑时出错: {e}")
+            return self._create_black_frame()
+            
+    def _render_clip_frame(self, clip: TimelineClip, clip_time: float) -> Optional[np.ndarray]:
+        """渲染单个剪辑的帧"""
+        try:
+            if clip.media_item.media_type == 'video':
+                return self._extract_video_frame(clip.media_item.file_path, clip_time)
+            elif clip.media_item.media_type == 'image':
+                return self._load_image_frame(clip.media_item.file_path)
+            else:
+                # 音频或其他类型，返回透明帧
+                return None
+                
+        except Exception as e:
+            print(f"渲染剪辑帧时出错: {e}")
+            return None
+            
+    def _extract_video_frame(self, video_path: str, time_seconds: float) -> Optional[np.ndarray]:
+        """从视频文件提取指定时间的帧"""
+        try:
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                return None
+                
+            # 设置到指定时间
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_number = int(time_seconds * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            
+            ret, frame = cap.read()
+            cap.release()
+            
+            if ret:
+                # 调整到目标分辨率
+                frame_resized = cv2.resize(frame, self.resolution)
+                return cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"提取视频帧时出错: {e}")
+            return None
+            
+    def _load_image_frame(self, image_path: str) -> Optional[np.ndarray]:
+        """加载图片帧"""
+        try:
+            image = cv2.imread(str(image_path))
+            if image is not None:
+                # 调整到目标分辨率
+                image_resized = cv2.resize(image, self.resolution)
+                return cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB)
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"加载图片帧时出错: {e}")
+            return None
+            
+    def _blend_frame(self, canvas: np.ndarray, frame: np.ndarray, track: int) -> np.ndarray:
+        """将帧混合到画布上"""
+        # 简单的覆盖混合（后续可以添加更复杂的混合模式）
+        return frame
+        
+    def _numpy_to_qpixmap(self, array: np.ndarray) -> QPixmap:
+        """将numpy数组转换为QPixmap"""
+        height, width, channel = array.shape
+        bytes_per_line = 3 * width
+        q_image = QImage(array.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(q_image)
+        
+    def _create_black_frame(self) -> QPixmap:
+        """创建黑色帧"""
+        pixmap = QPixmap(self.resolution[0], self.resolution[1])
+        pixmap.fill(Qt.GlobalColor.black)
+        return pixmap
+        
+    def _simple_render(self, clips: List[TimelineClip], time_seconds: float) -> Optional[QPixmap]:
+        """简化渲染（当OpenCV不可用时）"""
+        if not clips:
+            return self._create_black_frame()
+            
+        # 选择最上层的剪辑
+        top_clip = max(clips, key=lambda c: c.track)
+        
+        # 尝试加载媒体文件的缩略图
+        thumbnail = top_clip.media_item.generate_thumbnail(self.resolution)
+        if thumbnail:
+            return thumbnail.scaled(
+                self.resolution[0], self.resolution[1],
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+        else:
+            return self._create_black_frame()
+
 class CustomMediaListWidget(QListWidget):
     """自定义媒体列表组件，重写拖拽方法"""
     
@@ -374,6 +618,13 @@ class MediaLibraryWidget(QWidget):
         
         # 启用鼠标点击事件
         self.setMouseTracking(True)
+        
+        # 预览相关
+        self.preview_timer = QTimer()
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self.show_hover_preview)
+        self.hover_item = None
+        self.preview_popup = None
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -398,6 +649,14 @@ class MediaLibraryWidget(QWidget):
         
         # 连接双击事件
         self.media_list.itemDoubleClicked.connect(self.on_item_double_clicked)
+        
+        # 连接鼠标事件
+        self.media_list.itemEntered.connect(self.on_item_hover)
+        self.media_list.leaveEvent = self.on_list_leave
+        
+        # 设置右键菜单
+        self.media_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.media_list.customContextMenuRequested.connect(self.show_context_menu)
         
         # 设置为图标视图模式，突出显示缩略图
         self.media_list.setViewMode(QListWidget.ViewMode.IconMode)
@@ -454,78 +713,219 @@ class MediaLibraryWidget(QWidget):
         
         for file_path in file_paths:
             self.add_media_item(file_path)
+            # 标记项目为已修改
+            main_window = self.get_main_window()
+            if main_window:
+                main_window.mark_project_modified()
     
-    def add_media_item(self, file_path: str):
-        """添加媒体项目"""
-        # 创建媒体项目并验证文件类型
-        media_item = MediaItem(file_path)
-        
-        # 检查是否为有效的媒体文件
-        if not media_item.is_valid_media_file():
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.warning(
-                self,
-                "无效文件类型",
-                f"文件 '{media_item.name}' 不是支持的媒体文件类型。\n\n"
-                f"支持的格式：\n"
-                f"• 视频：mp4, avi, mov, mkv, wmv, flv, m4v, webm\n"
-                f"• 音频：mp3, wav, aac, m4a, flac, ogg\n"
-                f"• 图片：jpg, jpeg, png, bmp, gif, tiff"
-            )
-            return
-        
-        self.media_items.append(media_item)
-        
-        # 创建列表项
-        list_item = QListWidgetItem()
-        
-        # 简化文本显示，重点突出文件名
-        file_name = media_item.name
-        if len(file_name) > 15:
-            file_name = file_name[:12] + "..."
-        
-        # 根据媒体类型显示不同信息
-        if media_item.media_type == 'video':
-            duration_text = f"{media_item.duration:.1f}s"
-            resolution_text = f"{media_item.width}x{media_item.height}" if media_item.width > 0 else ""
-            list_item.setText(f"{file_name}\n{duration_text}\n{resolution_text}")
-        elif media_item.media_type == 'audio':
-            duration_text = f"{media_item.duration:.1f}s"
-            list_item.setText(f"{file_name}\n{duration_text}\n♪ 音频")
-        elif media_item.media_type == 'image':
-            resolution_text = f"{media_item.width}x{media_item.height}" if media_item.width > 0 else ""
-            list_item.setText(f"{file_name}\n🖼️ 图片\n{resolution_text}")
-        else:
-            list_item.setText(f"{file_name}\n未知格式")
-        
-        list_item.setData(Qt.ItemDataRole.UserRole, len(self.media_items) - 1)
-        
-        # 生成更大尺寸的缩略图
-        thumbnail = media_item.generate_thumbnail((120, 90))
-        if thumbnail:
-            list_item.setIcon(QIcon(thumbnail))
-        else:
-            # 如果无法生成缩略图，创建默认图标
-            self._create_default_icon(list_item, media_item.media_type)
-        
-        # 设置工具提示显示完整信息
-        tooltip = f"文件: {media_item.name}\n"
-        tooltip += f"路径: {media_item.file_path}\n"
-        tooltip += f"类型: {media_item.media_type}\n"
-        if media_item.duration > 0:
-            tooltip += f"时长: {media_item.duration:.2f}秒\n"
-        if media_item.width > 0 and media_item.height > 0:
-            tooltip += f"分辨率: {media_item.width}x{media_item.height}\n"
-        if media_item.file_size > 0:
-            size_mb = media_item.file_size / (1024 * 1024)
-            tooltip += f"大小: {size_mb:.1f}MB"
-        list_item.setToolTip(tooltip)
-        
-        self.media_list.addItem(list_item)
+
     
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+    
+    def on_item_hover(self, item):
+        """处理媒体项悬停事件"""
+        if item != self.hover_item:
+            self.hover_item = item
+            # 延迟显示预览，避免快速移动时频繁触发
+            self.preview_timer.start(500)  # 500ms延迟
+    
+    def on_list_leave(self, event):
+        """鼠标离开列表时隐藏预览"""
+        self.hide_hover_preview()
+        if hasattr(self.media_list, 'leaveEvent_original'):
+            self.media_list.leaveEvent_original(event)
+    
+    def show_hover_preview(self):
+        """显示悬停预览"""
+        if not self.hover_item:
+            return
+            
+        try:
+            media_index = self.hover_item.data(Qt.ItemDataRole.UserRole)
+            if media_index is not None:
+                media_item = self.get_media_item(media_index)
+                if media_item and media_item.media_type == 'video':
+                    # 只为视频文件显示悬停预览
+                    self.create_preview_popup(media_item)
+        except Exception as e:
+            print(f"显示悬停预览时出错: {e}")
+    
+    def hide_hover_preview(self):
+        """隐藏悬停预览"""
+        self.preview_timer.stop()
+        self.hover_item = None
+        if self.preview_popup:
+            self.preview_popup.hide()
+            self.preview_popup = None
+    
+    def create_preview_popup(self, media_item):
+        """创建预览弹窗"""
+        if self.preview_popup:
+            self.preview_popup.hide()
+        
+        # 创建预览弹窗
+        self.preview_popup = QWidget()
+        self.preview_popup.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.preview_popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        
+        layout = QVBoxLayout(self.preview_popup)
+        layout.setContentsMargins(5, 5, 5, 5)
+        
+        # 预览标签
+        preview_label = QLabel()
+        preview_label.setFixedSize(200, 150)
+        preview_label.setStyleSheet("border: 1px solid #ccc; background-color: black;")
+        preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # 加载视频缩略图
+        thumbnail = media_item.generate_thumbnail((200, 150))
+        if thumbnail:
+            preview_label.setPixmap(thumbnail)
+        else:
+            preview_label.setText("无法预览")
+            preview_label.setStyleSheet("border: 1px solid #ccc; background-color: #f0f0f0; color: #666;")
+        
+        layout.addWidget(preview_label)
+        
+        # 媒体信息
+        info_label = QLabel()
+        info_text = f"<b>{media_item.name}</b><br>"
+        info_text += f"时长: {media_item.duration:.1f}s<br>"
+        if media_item.width > 0 and media_item.height > 0:
+            info_text += f"分辨率: {media_item.width}x{media_item.height}<br>"
+        if media_item.file_size > 0:
+            size_mb = media_item.file_size / (1024 * 1024)
+            info_text += f"大小: {size_mb:.1f}MB"
+        info_label.setText(info_text)
+        info_label.setStyleSheet("background-color: white; padding: 5px; border: 1px solid #ccc;")
+        layout.addWidget(info_label)
+        
+        # 定位弹窗
+        cursor_pos = QCursor.pos()
+        self.preview_popup.move(cursor_pos.x() + 10, cursor_pos.y() + 10)
+        self.preview_popup.show()
+    
+    def show_context_menu(self, position):
+        """显示右键菜单"""
+        item = self.media_list.itemAt(position)
+        if not item:
+            return
+        
+        media_index = item.data(Qt.ItemDataRole.UserRole)
+        if media_index is None:
+            return
+            
+        media_item = self.get_media_item(media_index)
+        if not media_item:
+            return
+        
+        # 创建右键菜单
+        menu = QMenu(self)
+        
+        # 预览播放动作
+        if media_item.media_type in ['video', 'audio']:
+            preview_action = QAction("🎬 预览播放", self)
+            preview_action.triggered.connect(lambda: self.preview_play_media(media_item))
+            menu.addAction(preview_action)
+        
+        # 加载到预览器动作
+        load_action = QAction("📺 加载到预览器", self)
+        load_action.triggered.connect(lambda: self.load_to_preview(media_item))
+        menu.addAction(load_action)
+        
+        # 添加到时间轴动作
+        add_timeline_action = QAction("➕ 添加到时间轴", self)
+        add_timeline_action.triggered.connect(lambda: self.add_to_timeline(media_item))
+        menu.addAction(add_timeline_action)
+        
+        menu.addSeparator()
+        
+        # 属性动作
+        properties_action = QAction("ℹ️ 属性", self)
+        properties_action.triggered.connect(lambda: self.show_media_properties(media_item))
+        menu.addAction(properties_action)
+        
+        # 显示菜单
+        menu.exec(self.media_list.mapToGlobal(position))
+    
+    def preview_play_media(self, media_item):
+        """预览播放媒体"""
+        try:
+            main_window = self.get_main_window()
+            if main_window and hasattr(main_window, 'video_preview'):
+                # 确保退出时间轴模式
+                main_window.video_preview.disable_timeline_preview()
+                # 加载并播放媒体
+                main_window.video_preview.load_media(media_item.file_path)
+                # 延迟播放，等待加载完成
+                QTimer.singleShot(500, lambda: main_window.video_preview.media_player.play())
+                print(f"预览播放: {media_item.name}")
+        except Exception as e:
+            print(f"预览播放媒体时出错: {e}")
+    
+    def load_to_preview(self, media_item):
+        """加载媒体到预览器"""
+        try:
+            main_window = self.get_main_window()
+            if main_window and hasattr(main_window, 'video_preview'):
+                main_window.video_preview.load_media(media_item.file_path)
+                print(f"已加载到预览器: {media_item.name}")
+        except Exception as e:
+            print(f"加载媒体到预览器时出错: {e}")
+    
+    def add_to_timeline(self, media_item):
+        """添加媒体到时间轴"""
+        try:
+            main_window = self.get_main_window()
+            if main_window and hasattr(main_window, 'timeline'):
+                # 发射信号，添加到时间轴的第一个轨道
+                self.media_dropped.emit(media_item.file_path, 0)
+                print(f"已添加到时间轴: {media_item.name}")
+        except Exception as e:
+            print(f"添加媒体到时间轴时出错: {e}")
+    
+    def show_media_properties(self, media_item):
+        """显示媒体属性"""
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"媒体属性 - {media_item.name}")
+            dialog.setFixedSize(400, 300)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # 创建属性文本
+            properties_text = f"<h3>{media_item.name}</h3>"
+            properties_text += f"<b>文件路径:</b> {media_item.file_path}<br><br>"
+            properties_text += f"<b>媒体类型:</b> {media_item.media_type}<br>"
+            
+            if media_item.duration > 0:
+                properties_text += f"<b>时长:</b> {media_item.duration:.2f} 秒<br>"
+            
+            if media_item.width > 0 and media_item.height > 0:
+                properties_text += f"<b>分辨率:</b> {media_item.width} x {media_item.height}<br>"
+            
+            if media_item.file_size > 0:
+                size_mb = media_item.file_size / (1024 * 1024)
+                properties_text += f"<b>文件大小:</b> {size_mb:.1f} MB<br>"
+            
+            properties_text += f"<b>文件格式:</b> {media_item.file_path.suffix.lower()}<br>"
+            
+            properties_label = QLabel(properties_text)
+            properties_label.setWordWrap(True)
+            properties_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+            layout.addWidget(properties_label)
+            
+            # 关闭按钮
+            close_btn = QPushButton("关闭")
+            close_btn.clicked.connect(dialog.accept)
+            layout.addWidget(close_btn)
+            
+            dialog.exec()
+            
+        except Exception as e:
+            print(f"显示媒体属性时出错: {e}")
     
     def _create_default_icon(self, list_item: QListWidgetItem, media_type: str):
         """为无法生成缩略图的文件创建默认图标"""
@@ -585,6 +985,93 @@ class MediaLibraryWidget(QWidget):
             if isinstance(widget, QMainWindow):
                 return widget
         return None
+    
+    def clear_media(self):
+        """清空媒体库"""
+        self.media_items.clear()
+        self.media_list.clear()
+        self.hide_hover_preview()
+    
+    def add_media_item(self, media_item_or_path):
+        """添加媒体项目（支持文件路径或MediaItem对象）"""
+        if isinstance(media_item_or_path, str):
+            # 如果是文件路径，按原来的逻辑处理
+            self._add_media_item_from_path(media_item_or_path)
+        elif isinstance(media_item_or_path, MediaItem):
+            # 如果是MediaItem对象，直接添加
+            self._add_media_item_object(media_item_or_path)
+    
+    def _add_media_item_from_path(self, file_path: str):
+        """从文件路径添加媒体项目"""
+        # 创建媒体项目并验证文件类型
+        media_item = MediaItem(file_path)
+        
+        # 检查是否为有效的媒体文件
+        if not media_item.is_valid_media_file():
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "无效文件类型",
+                f"文件 '{media_item.name}' 不是支持的媒体文件类型。\n\n"
+                f"支持的格式：\n"
+                f"• 视频：mp4, avi, mov, mkv, wmv, flv, m4v, webm\n"
+                f"• 音频：mp3, wav, aac, m4a, flac, ogg\n"
+                f"• 图片：jpg, jpeg, png, bmp, gif, tiff"
+            )
+            return
+        
+        self._add_media_item_object(media_item)
+    
+    def _add_media_item_object(self, media_item: MediaItem):
+        """添加MediaItem对象到媒体库"""
+        self.media_items.append(media_item)
+        
+        # 创建列表项
+        list_item = QListWidgetItem()
+        
+        # 简化文本显示，重点突出文件名
+        file_name = media_item.name
+        if len(file_name) > 15:
+            file_name = file_name[:12] + "..."
+        
+        # 根据媒体类型显示不同信息
+        if media_item.media_type == 'video':
+            duration_text = f"{media_item.duration:.1f}s"
+            resolution_text = f"{media_item.width}x{media_item.height}" if media_item.width > 0 else ""
+            list_item.setText(f"{file_name}\n{duration_text}\n{resolution_text}")
+        elif media_item.media_type == 'audio':
+            duration_text = f"{media_item.duration:.1f}s"
+            list_item.setText(f"{file_name}\n{duration_text}\n♪ 音频")
+        elif media_item.media_type == 'image':
+            resolution_text = f"{media_item.width}x{media_item.height}" if media_item.width > 0 else ""
+            list_item.setText(f"{file_name}\n🖼️ 图片\n{resolution_text}")
+        else:
+            list_item.setText(f"{file_name}\n未知格式")
+        
+        list_item.setData(Qt.ItemDataRole.UserRole, len(self.media_items) - 1)
+        
+        # 生成更大尺寸的缩略图
+        thumbnail = media_item.generate_thumbnail((120, 90))
+        if thumbnail:
+            list_item.setIcon(QIcon(thumbnail))
+        else:
+            # 如果无法生成缩略图，创建默认图标
+            self._create_default_icon(list_item, media_item.media_type)
+        
+        # 设置工具提示显示完整信息
+        tooltip = f"文件: {media_item.name}\n"
+        tooltip += f"路径: {media_item.file_path}\n"
+        tooltip += f"类型: {media_item.media_type}\n"
+        if media_item.duration > 0:
+            tooltip += f"时长: {media_item.duration:.2f}秒\n"
+        if media_item.width > 0 and media_item.height > 0:
+            tooltip += f"分辨率: {media_item.width}x{media_item.height}\n"
+        if media_item.file_size > 0:
+            size_mb = media_item.file_size / (1024 * 1024)
+            tooltip += f"大小: {size_mb:.1f}MB"
+        list_item.setToolTip(tooltip)
+        
+        self.media_list.addItem(list_item)
     
     def dropEvent(self, event: QDropEvent):
         """处理文件拖拽事件"""
@@ -822,6 +1309,7 @@ class TimelineWidget(QGraphicsView):
     
     # 定义信号
     playhead_position_changed = pyqtSignal(float)  # 播放头位置变化信号
+    clips_changed = pyqtSignal()  # 剪辑变化信号
     
     def __init__(self):
         super().__init__()
@@ -860,6 +1348,15 @@ class TimelineWidget(QGraphicsView):
         # 播放头拖动
         self.is_scrubbing = False
         self.playhead_dragging = False  # 专门的播放头拖动标志
+        self.playhead_interaction_mode = None  # 播放头交互模式：'jump' 或 'drag'
+        self.drag_start_pos = None  # 拖动开始位置
+        self.drag_start_time = None  # 拖动开始时间
+        
+        # 注册到播放头控制器
+        if PLAYHEAD_CONTROLLER_AVAILABLE and playhead_controller:
+            playhead_controller.register_timeline_playhead(self)
+            playhead_controller.position_changed.connect(self.on_playhead_controller_position_changed)
+            playhead_controller.set_duration(self.timeline_duration)
         
         self.setup_ui()
         self.setAcceptDrops(True)
@@ -993,6 +1490,7 @@ class TimelineWidget(QGraphicsView):
                 QPen(QColor(255, 0, 0), 3)  # 红色播放头，加粗便于拖动
             )
             self.playhead.setZValue(15)  # 确保播放头在最上层
+            self.playhead.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)  # 禁用默认拖动，使用自定义拖动逻辑
             
             # 播放头顶部三角形（拖动手柄）
             triangle_size = 12  # 增大三角形便于拖动
@@ -1016,6 +1514,9 @@ class TimelineWidget(QGraphicsView):
             
             self.playhead_triangle = self.scene.addPolygon(triangle, QPen(triangle_border, 2), QBrush(triangle_color))
             self.playhead_triangle.setZValue(15)  # 确保三角形在最上层
+            self.playhead_triangle.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)  # 可选择
+            self.playhead_triangle.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)  # 禁用默认拖动，使用自定义拖动逻辑
+            self.playhead_triangle.setCursor(Qt.CursorShape.OpenHandCursor)  # 设置手型光标提示可拖动
             
             # 添加播放头时间显示
             if hasattr(self, 'playhead_dragging') and self.playhead_dragging:
@@ -1042,6 +1543,9 @@ class TimelineWidget(QGraphicsView):
             self.playhead_drag_area.setBrush(QBrush(QColor(0, 0, 0, 0)))  # 完全透明
             self.playhead_drag_area.setPen(QPen(QColor(0, 0, 0, 0)))  # 无边框
             self.playhead_drag_area.setZValue(16)  # 在播放头之上
+            self.playhead_drag_area.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)  # 可选择
+            self.playhead_drag_area.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)  # 禁用默认拖动，使用自定义拖动逻辑
+            self.playhead_drag_area.setCursor(Qt.CursorShape.OpenHandCursor)  # 设置手型光标提示可拖动
             self.scene.addItem(self.playhead_drag_area)
             
         except Exception as e:
@@ -1155,114 +1659,87 @@ class TimelineWidget(QGraphicsView):
     def get_current_time(self) -> float:
         """获取当前播放时间"""
         return self.current_time
+    
+    def get_main_window(self):
+        """获取主窗口引用"""
+        parent = self.parent()
+        while parent:
+            if isinstance(parent, QMainWindow):
+                return parent
+            parent = parent.parent()
+        return None
 
     def mousePressEvent(self, event):
-        """鼠标按下事件 - 处理剪辑选择、播放位置设置和范围选择"""
+        """重构的鼠标按下事件，区分点击和拖动意图"""
         try:
             scene_pos = self.mapToScene(event.pos())
             item = self.scene.itemAt(scene_pos, self.transform())
 
-            # 首先检查是否点击了播放头区域（优先级最高）
             if event.button() == Qt.MouseButton.LeftButton:
+                # 检查是否按下了Shift键，用于范围选择
+                is_shift_pressed = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+
+                # 1. 确定是否与播放头交互
                 playhead_x = self.current_time * self.pixels_per_second
-                # 优化播放头点击区域检测，使用更精确的范围
-                playhead_click_tolerance = 12  # 点击容差
-                playhead_area = QRectF(playhead_x - playhead_click_tolerance, -30, 
-                                     playhead_click_tolerance * 2, self.scene.height() + 60)
+                playhead_click_tolerance = 15
+                playhead_area = QRectF(playhead_x - playhead_click_tolerance, -45, 
+                                     playhead_click_tolerance * 2, self.scene.height() + 75)
                 
-                print(f"[DEBUG] 播放头检测: 点击位置({scene_pos.x():.1f}, {scene_pos.y():.1f}), 播放头X={playhead_x:.1f}")
-                print(f"[DEBUG] 播放头点击区域: {playhead_area}")
+                is_on_playhead = playhead_area.contains(scene_pos)
+                is_on_clip = isinstance(item, QGraphicsRectItem)
                 
-                if playhead_area.contains(scene_pos):
-                    # 点击播放头区域，开始拖动播放头
-                    self.selected_clips = []  # 清除剪辑选择
-                    self.clear_range_selection()  # 清除范围选择
-                    
-                    try:
-                        main_window = self.get_main_window()
-                        if main_window:
-                            self.was_playing_before_scrub = main_window.is_playing()
-                            if self.was_playing_before_scrub:
-                                main_window.pause_video()
-                    except Exception as e:
-                        print(f"[WARNING] 暂停视频失败: {e}")
-                        self.was_playing_before_scrub = False
-                    
-                    # 设置拖动状态和相关属性
-                    self.is_scrubbing = True
-                    self.playhead_dragging = True  # 新增专门的播放头拖动标志
-                    self.drag_start_pos = scene_pos
-                    self.drag_start_time = self.current_time
-                    
-                    # 立即更新播放头到点击位置
+                print(f"[DEBUG] 鼠标点击检测: 场景位置=({scene_pos.x():.1f}, {scene_pos.y():.1f}), 播放头X={playhead_x:.1f}, 在播放头上={is_on_playhead}, 在剪辑上={is_on_clip}")
+                if is_on_playhead:
+                    print(f"[DEBUG] *** 检测到播放头点击，准备进入拖动模式 ***")
+
+                # 2. 根据不同情况处理事件
+                if is_shift_pressed:
+                    # 开始范围选择
+                    self.start_range_selection(scene_pos)
+                    event.accept()
+                    return
+                
+                else:
+                    # 计算时间位置
                     new_time = scene_pos.x() / self.pixels_per_second
                     new_time = max(0, min(new_time, self.total_duration))
-                    self.current_time = new_time
                     
-                    # 更新播放头视觉状态
-                    self.draw_playhead()
+                    # 使用播放头控制器处理交互
+                    if PLAYHEAD_CONTROLLER_AVAILABLE and playhead_controller:
+                        if playhead_controller.handle_click(new_time, is_on_playhead):
+                            event.accept()
+                            return
                     
-                    # 同步视频预览
-                    try:
-                        main_window = self.get_main_window()
-                        if main_window:
-                            main_window.seek_to_time(new_time)
-                    except Exception as e:
-                        print(f"[WARNING] 视频预览同步失败: {e}")
-                    
-                    # 设置鼠标光标为拖动状态
-                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
-                    
-                    print(f"[DEBUG] 开始拖动播放头，当前时间: {self.current_time:.2f}s")
-                    event.accept()  # 明确接受事件
-                    return
-
-            # Shift+左键点击，开始范围选择
-            if event.button() == Qt.MouseButton.LeftButton and (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
-                self.start_range_selection(scene_pos)
-                super().mousePressEvent(event)
-                return
-
-            # 点击的是剪辑
-            if isinstance(item, QGraphicsRectItem):
-                # 寻找对应的剪辑对象
-                for clip, graphics in self.clip_graphics.items():
-                    if graphics['rect'] == item:
-                        # Ctrl+左键点击，多选
-                        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                            if clip in self.selected_clips:
-                                self.selected_clips.remove(clip)
-                            else:
-                                self.selected_clips.append(clip)
-                        # 普通左键点击，单选
-                        else:
-                            self.selected_clips = [clip]
-                        
-                        self.redraw_timeline()  # 重绘以更新选中状态
-                        super().mousePressEvent(event)
+                    # 兼容模式：直接处理播放头交互
+                    if is_on_playhead:
+                        self.playhead_interaction_mode = 'jump'
+                        self.is_scrubbing = True
+                        self.drag_start_pos = scene_pos
+                        self.playhead_dragging = False
+                        self.set_current_time(new_time)
+                        print(f"[DEBUG] 播放头点击（兼容模式），时间: {new_time:.2f}s")
+                        event.accept()
                         return
-
-            # 只要不是在进行范围选择，就更新播放头位置并准备拖动
-            if event.button() == Qt.MouseButton.LeftButton:
-                try:
-                    main_window = self.get_main_window()
-                    if main_window:
-                        self.was_playing_before_scrub = main_window.is_playing()
-                        if self.was_playing_before_scrub:
-                            main_window.pause_video()
-                except Exception as e:
-                    print(f"[WARNING] 处理播放状态失败: {e}")
-                    self.was_playing_before_scrub = False
-                    
-                time_seconds = scene_pos.x() / self.pixels_per_second
-                self.update_playhead_position(time_seconds)
-                self.is_scrubbing = True  # 开始拖动播放头
-
-                # 如果点击的是空白区域，则清除选择
-                if not isinstance(item, QGraphicsRectItem):
-                    self.clear_range_selection()
-                    self.selected_clips = []
-                    self.redraw_timeline()
+                    elif not is_on_clip:
+                        self.set_current_time(new_time)
+                        print(f"[DEBUG] 时间轴点击（兼容模式），跳转到: {new_time:.2f}s")
+                        event.accept()
+                        return
+                    elif is_on_clip:
+                        # 处理剪辑选择
+                        for clip, graphics in self.clip_graphics.items():
+                            if graphics['rect'] == item:
+                                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                                    if clip in self.selected_clips:
+                                        self.selected_clips.remove(clip)
+                                    else:
+                                        self.selected_clips.append(clip)
+                                else:
+                                    self.selected_clips = [clip]
+                                
+                                self.redraw_timeline()
+                                super().mousePressEvent(event) # 允许父类处理拖动
+                                return
 
             super().mousePressEvent(event)
             
@@ -1278,152 +1755,146 @@ class TimelineWidget(QGraphicsView):
     
 
     
+    def set_current_time(self, new_time):
+        """设置当前时间并同步所有相关组件"""
+        self.current_time = new_time
+        self.draw_playhead()
+        self.sync_video_preview(new_time)
+        self.playhead_position_changed.emit(new_time)
+    
+    def on_playhead_controller_position_changed(self, new_time):
+        """播放头控制器位置变化回调"""
+        self.current_time = new_time
+        self.draw_playhead()
+        self.sync_video_preview(new_time)
+        # 不需要再次发射信号，避免循环
+
+    def start_playhead_drag(self, scene_pos):
+        """开始播放头拖动的辅助函数"""
+        print("[DEBUG] 开始拖拽时间滑块")
+        try:
+            main_window = self.get_main_window()
+            if main_window:
+                self.was_playing_before_scrub = main_window.is_playing()
+                if self.was_playing_before_scrub:
+                    main_window.pause_video()
+        except Exception as e:
+            print(f"[WARNING] 暂停视频失败: {e}")
+            self.was_playing_before_scrub = False
+        
+        self.is_scrubbing = True
+        self.playhead_dragging = True
+        self.drag_start_time = self.current_time
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def finish_playhead_drag(self):
+        """完成播放头拖动的辅助函数"""
+        print("[DEBUG] 结束拖拽时间滑块")
+        try:
+            main_window = self.get_main_window()
+            if main_window and self.was_playing_before_scrub:
+                main_window.play_video()
+        except Exception as e:
+            print(f"[WARNING] 恢复播放状态失败: {e}")
+        self.was_playing_before_scrub = False
+
+    def sync_video_preview(self, new_time):
+        """同步视频预览的辅助函数"""
+        try:
+            main_window = self.get_main_window()
+            if main_window and hasattr(main_window, 'video_preview'):
+                video_preview = main_window.video_preview
+                if video_preview.timeline_mode:
+                    video_preview.seek_timeline_position(new_time)
+                else:
+                    position_ms = int(new_time * 1000)
+                    video_preview.set_position(position_ms)
+        except Exception as e:
+            print(f"[WARNING] 视频预览同步失败: {e}")
+
     def mouseMoveEvent(self, event):
-        """鼠标移动事件 - 处理范围选择、剪辑拖动和播放头拖动"""
+        """重构的鼠标移动事件，处理拖动状态转换"""
         try:
             scene_pos = self.mapToScene(event.pos())
 
-            # 范围选择
+            # 如果正在范围选择，则更新范围
             if self.is_selecting_range:
                 self.update_range_selection(scene_pos)
+                event.accept()
                 return
 
-            # 播放头拖动 - 参考预览滑块的实现逻辑
-            if self.is_scrubbing and hasattr(self, 'playhead_dragging') and self.playhead_dragging:
+            # 使用播放头控制器处理拖动
+            if PLAYHEAD_CONTROLLER_AVAILABLE and playhead_controller:
                 new_time = scene_pos.x() / self.pixels_per_second
                 new_time = max(0, min(new_time, self.total_duration))
+                if playhead_controller.handle_drag(new_time):
+                    event.accept()
+                    return
+            
+            # 兼容模式：如果正在进行播放头交互，则处理拖动
+            if self.is_scrubbing:
+                # 检查是否从'jump'模式切换到'drag'模式
+                if self.playhead_interaction_mode == 'jump':
+                    distance = (scene_pos - self.drag_start_pos).manhattanLength()
+                    if distance > 5:  # 移动超过阈值才认为是拖动
+                        self.playhead_interaction_mode = 'drag'
+                        self.start_playhead_drag(scene_pos)
+                        print("[DEBUG] 模式切换: jump -> drag")
                 
-                # 使用更小的阈值以提供更流畅的拖动体验
-                time_threshold = 0.005  # 5毫秒阈值，比之前的10毫秒更敏感
+                # 如果是拖动模式，则更新播放头
+                if self.playhead_interaction_mode == 'drag':
+                    new_time = scene_pos.x() / self.pixels_per_second
+                    new_time = max(0, min(new_time, self.total_duration))
+                    
+                    if abs(new_time - self.current_time) > 0.001:
+                        self.set_current_time(new_time)
                 
-                if abs(new_time - self.current_time) > time_threshold:
-                    self.current_time = new_time
-                    
-                    # 立即更新播放头视觉状态
-                    self.draw_playhead()
-                    
-                    # 同步视频预览 - 使用类似预览滑块的方式
-                    try:
-                        main_window = self.get_main_window()
-                        if main_window and hasattr(main_window, 'video_preview'):
-                            # 直接设置播放器位置，类似预览滑块的set_position方法
-                            position_ms = int(new_time * 1000)
-                            main_window.video_preview.media_player.setPosition(position_ms)
-                            
-                            # 同步预览滑块位置（防止循环更新）
-                            if not main_window.video_preview.is_seeking:
-                                main_window.video_preview.position_slider.setValue(position_ms)
-                    except Exception as e:
-                        print(f"[WARNING] 视频预览更新失败: {e}")
-                    
-                    # 发射播放头位置变化信号
-                    self.playhead_position_changed.emit(self.current_time)
-                
-                event.accept()  # 明确接受事件
+                event.accept()
                 return
 
-            # 剪辑拖动 (由父类处理)
             super().mouseMoveEvent(event)
             
         except Exception as e:
             print(f"[ERROR] 鼠标移动事件处理失败: {e}")
             import traceback
             traceback.print_exc()
-            # 确保父类事件仍然被处理
             try:
                 super().mouseMoveEvent(event)
-            except:
-                pass
+            except: pass
     
     def mouseReleaseEvent(self, event):
-        """鼠标释放事件 - 完成范围选择、剪辑拖动和播放头拖动"""
+        """重构的鼠标释放事件，清理所有状态"""
         try:
             scene_pos = self.mapToScene(event.pos())
 
-            # 停止播放头拖动
-            if self.is_scrubbing and hasattr(self, 'playhead_dragging') and self.playhead_dragging:
-                # 清理拖动状态
+            # 使用播放头控制器处理释放事件
+            if PLAYHEAD_CONTROLLER_AVAILABLE and playhead_controller:
+                playhead_controller.handle_drag_end()
+                event.accept()
+                return
+            
+            # 兼容模式：完成播放头交互
+            if self.is_scrubbing:
+                if self.playhead_interaction_mode == 'drag':
+                    # 如果是拖动，则进行最终的位置同步和状态恢复
+                    self.finish_playhead_drag()
+                
+                # 重置所有相关状态
                 self.is_scrubbing = False
                 self.playhead_dragging = False
-                
-                # 恢复鼠标光标
+                self.playhead_interaction_mode = None
+                self.drag_start_pos = None
                 self.setCursor(Qt.CursorShape.ArrowCursor)
                 
-                # 最终位置同步 - 确保精确定位
-                final_time = scene_pos.x() / self.pixels_per_second
-                final_time = max(0, min(final_time, self.total_duration))
-                self.current_time = final_time
-                
-                # 重新绘制播放头以更新视觉状态
-                self.draw_playhead()
-                
-                # 最终同步视频预览位置
-                try:
-                    main_window = self.get_main_window()
-                    if main_window and hasattr(main_window, 'video_preview'):
-                        position_ms = int(final_time * 1000)
-                        main_window.video_preview.media_player.setPosition(position_ms)
-                        # 同步预览滑块
-                        if not main_window.video_preview.is_seeking:
-                            main_window.video_preview.position_slider.setValue(position_ms)
-                except Exception as e:
-                    print(f"[WARNING] 最终位置同步失败: {e}")
-                
-                # 恢复播放状态
-                try:
-                    main_window = self.get_main_window()
-                    if main_window and self.was_playing_before_scrub:
-                        main_window.play_video()
-                except Exception as e:
-                    print(f"[WARNING] 恢复播放状态失败: {e}")
-                    
-                self.was_playing_before_scrub = False
-                
-                print(f"[DEBUG] 完成播放头拖动，最终时间: {self.current_time:.2f}s")
-                
-                # 清理拖动相关属性
-                if hasattr(self, 'drag_start_pos'):
-                    delattr(self, 'drag_start_pos')
-                if hasattr(self, 'drag_start_time'):
-                    delattr(self, 'drag_start_time')
-                
-                # 发射最终位置变化信号
-                self.playhead_position_changed.emit(self.current_time)
-                
-                event.accept()  # 明确接受事件
+                print(f"[DEBUG] 完成播放头交互，最终时间: {self.current_time:.2f}s")
+                event.accept()
                 return
 
-            # 完成范围选择
+            # 2. 完成范围选择
             if self.is_selecting_range:
                 self.finish_range_selection(scene_pos)
+                event.accept()
                 return
-
-            # 完成剪辑拖动，更新剪辑信息
-            if event.button() == Qt.MouseButton.LeftButton and self.selected_clips:
-                moved_clips = False
-                for clip in self.selected_clips:
-                    graphics = self.clip_graphics.get(clip)
-                    if graphics:
-                        new_pos = graphics['rect'].pos()
-                        
-                        # 计算新的开始时间和轨道，并进行边界检查
-                        new_start_time = new_pos.x() / self.pixels_per_second
-                        new_track = int((new_pos.y() + self.track_height / 2) // self.track_height)
-
-                        if new_start_time < 0:
-                            new_start_time = 0
-                        if new_track < 0:
-                            new_track = 0
-                        if new_track >= self.tracks:
-                            new_track = self.tracks - 1
-
-                        if clip.start_time != new_start_time or clip.track != new_track:
-                            clip.start_time = new_start_time
-                            clip.track = new_track
-                            moved_clips = True
-                
-                if moved_clips:
-                    self.redraw_timeline()
 
             super().mouseReleaseEvent(event)
             
@@ -1573,6 +2044,9 @@ class TimelineWidget(QGraphicsView):
         # 更新时间轴总时长
         self.update_timeline_duration()
         
+        # 发射剪辑变化信号
+        self.clips_changed.emit()
+        
         # 创建剪辑的图形表示
         x = start_time * self.pixels_per_second
         y = track * self.track_height
@@ -1653,7 +2127,10 @@ class TimelineWidget(QGraphicsView):
         # 场景从-ruler_height开始，确保时间标尺可见
         self.scene.setSceneRect(0, -ruler_height, scene_width, scene_height + ruler_height)
         
-        print(f"[DEBUG] 场景大小设置: 宽度={scene_width:.1f}, 高度={scene_height + ruler_height:.1f}, Y起始={-ruler_height}")
+        # 减少冗余的场景大小调试信息，只在场景大小实际改变时输出
+        if not hasattr(self, '_last_scene_size') or self._last_scene_size != (scene_width, scene_height + ruler_height):
+            print(f"[DEBUG] 场景大小设置: 宽度={scene_width:.1f}, 高度={scene_height + ruler_height:.1f}, Y起始={-ruler_height}")
+            self._last_scene_size = (scene_width, scene_height + ruler_height)
         
         # 重新绘制基础元素
         self.draw_tracks()
@@ -1732,6 +2209,13 @@ class TimelineWidget(QGraphicsView):
         
         print(f"已删除 {len(self.selected_clips)} 个剪辑")
         self.selected_clips.clear()
+        
+        # 更新时间轴总时长
+        self.update_timeline_duration()
+        
+        # 发射剪辑变化信号
+        self.clips_changed.emit()
+        
         self.redraw_timeline()
     
     def split_clip_at_playhead(self):
@@ -1769,6 +2253,13 @@ class TimelineWidget(QGraphicsView):
             self.clips.append(second_part)
         
         print(f"已在播放头位置分割 {len(clips_to_split)} 个剪辑")
+        
+        # 更新时间轴总时长
+        self.update_timeline_duration()
+        
+        # 发射剪辑变化信号
+        self.clips_changed.emit()
+        
         self.redraw_timeline()
     
     def cut_selected_clips(self):
@@ -2030,6 +2521,31 @@ class TimelineWidget(QGraphicsView):
             # 重置拖拽状态
             self.is_dragging = False
     
+    def add_media_to_timeline(self, file_path: str, track: int):
+        """添加媒体到时间轴"""
+        try:
+            # 创建媒体项
+            media_item = MediaItem(file_path)
+            
+            # 检查是否为有效的媒体文件
+            if not media_item.is_valid_media_file():
+                print(f"无效的媒体文件: {file_path}")
+                return
+            
+            # 计算开始时间（放在时间轴末尾）
+            start_time = 0.0
+            if self.clips:
+                # 找到最后一个剪辑的结束时间
+                max_end_time = max(clip.start_time + clip.duration for clip in self.clips)
+                start_time = max_end_time
+            
+            # 添加剪辑
+            self.add_clip(media_item, track, start_time)
+            print(f"已添加媒体到时间轴: {media_item.name} (轨道 {track}, 开始时间 {start_time})")
+            
+        except Exception as e:
+            print(f"添加媒体到时间轴时出错: {e}")
+    
     def get_main_window(self):
         """获取主窗口引用"""
         parent = self.parent()
@@ -2038,6 +2554,16 @@ class TimelineWidget(QGraphicsView):
                 return parent
             parent = parent.parent()
         return None
+    
+    def set_clips(self, clips: List[TimelineClip]):
+        """设置时间轴剪辑列表"""
+        self.clips = clips
+        self.selected_clips.clear()
+        self.update_timeline_duration()
+        self.redraw_timeline()
+        
+        # 发射剪辑变化信号
+        self.clips_changed.emit()
 
 class VideoPreviewWidget(QWidget):
     """视频预览组件"""
@@ -2050,17 +2576,44 @@ class VideoPreviewWidget(QWidget):
         self.current_media = None
         self.timeline_widget = None  # 时间轴组件引用
         self.is_seeking = False  # 防止循环更新的标志
+        
+        # 时间轴渲染引擎
+        self.timeline_renderer = TimelineRenderer()
+        self.timeline_mode = False  # 是否使用时间轴渲染模式
+        
+        # 渲染显示组件
+        self.rendered_frame_label = None
+        
         self.setup_ui()
+        
+        # 连接渲染引擎信号
+        self.timeline_renderer.frameReady.connect(self.display_rendered_frame)
+        self.timeline_renderer.renderError.connect(self.handle_render_error)
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
         
-        # 视频显示区域
+        # 视频显示区域容器
+        video_container = QWidget()
+        video_layout = QVBoxLayout(video_container)
+        video_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 原始视频播放器
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumSize(400, 300)
-        # 设置背景色以便调试
         self.video_widget.setStyleSheet("background-color: #2b2b2b; border: 1px solid #555;")
-        layout.addWidget(self.video_widget)
+        video_layout.addWidget(self.video_widget)
+        
+        # 渲染帧显示标签（用于时间轴渲染模式）
+        self.rendered_frame_label = QLabel()
+        self.rendered_frame_label.setMinimumSize(400, 300)
+        self.rendered_frame_label.setStyleSheet("background-color: #2b2b2b; border: 1px solid #555;")
+        self.rendered_frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rendered_frame_label.setScaledContents(True)
+        self.rendered_frame_label.hide()  # 默认隐藏
+        video_layout.addWidget(self.rendered_frame_label)
+        
+        layout.addWidget(video_container)
         
         # 播放控制
         controls = QHBoxLayout()
@@ -2070,6 +2623,8 @@ class VideoPreviewWidget(QWidget):
         controls.addWidget(self.play_btn)
         
         self.position_slider = QSlider(Qt.Orientation.Horizontal)
+        # 为滑块添加点击跳转功能
+        self.position_slider.mousePressEvent = self.slider_mouse_press_event
         controls.addWidget(self.position_slider)
         
         self.time_label = QLabel("00:00 / 00:00")
@@ -2257,6 +2812,27 @@ class VideoPreviewWidget(QWidget):
         position = self.position_slider.value()
         self.set_position(position)
     
+    def slider_mouse_press_event(self, event):
+        """滑块鼠标点击事件 - 实现点击跳转功能"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 计算点击位置对应的值
+            slider_width = self.position_slider.width() - self.position_slider.style().pixelMetric(self.position_slider.style().PixelMetric.PM_SliderLength)
+            click_pos = event.position().x() - self.position_slider.style().pixelMetric(self.position_slider.style().PixelMetric.PM_SliderLength) // 2
+            
+            if slider_width > 0:
+                # 计算点击位置对应的值
+                ratio = max(0, min(1, click_pos / slider_width))
+                new_value = int(self.position_slider.minimum() + ratio * (self.position_slider.maximum() - self.position_slider.minimum()))
+                
+                # 设置新位置
+                self.position_slider.setValue(new_value)
+                self.set_position(new_value)
+                
+                print(f"[DEBUG] 滑块点击跳转到位置: {new_value}ms")
+        
+        # 调用原始的鼠标按下事件以保持拖拽功能
+        QSlider.mousePressEvent(self.position_slider, event)
+    
     def format_time(self, ms):
         """格式化时间显示"""
         seconds = ms // 1000
@@ -2304,6 +2880,108 @@ class VideoPreviewWidget(QWidget):
                 "媒体错误",
                 "无法识别的媒体格式或文件已损坏。\n\n请尝试使用其他媒体文件。"
             )
+    
+    def set_timeline_mode(self, enabled: bool):
+        """设置时间轴渲染模式"""
+        self.timeline_mode = enabled
+        
+        if enabled:
+            # 切换到时间轴渲染模式
+            self.video_widget.hide()
+            self.rendered_frame_label.show()
+            print("[DEBUG] 切换到时间轴渲染模式")
+        else:
+            # 切换到单媒体播放模式
+            self.rendered_frame_label.hide()
+            self.video_widget.show()
+            print("[DEBUG] 切换到单媒体播放模式")
+    
+    def update_timeline_clips(self, clips: List[TimelineClip]):
+        """更新时间轴剪辑列表"""
+        self.timeline_renderer.set_clips(clips)
+        
+        # 如果当前是时间轴模式，重新渲染当前帧
+        if self.timeline_mode and self.timeline_widget:
+            current_time = self.timeline_widget.current_time
+            self.timeline_renderer.render_frame_at_time(current_time)
+    
+    def seek_timeline_position(self, time_seconds: float):
+        """跳转到时间轴指定位置"""
+        if self.timeline_mode:
+            # 时间轴渲染模式：渲染指定时间的帧
+            self.timeline_renderer.render_frame_at_time(time_seconds)
+        else:
+            # 单媒体播放模式：使用原有逻辑
+            if self.current_media:
+                position_ms = int(time_seconds * 1000)
+                self.media_player.setPosition(position_ms)
+    
+    def display_rendered_frame(self, pixmap: QPixmap):
+        """显示渲染完成的帧"""
+        if self.timeline_mode and self.rendered_frame_label:
+            self.rendered_frame_label.setPixmap(pixmap)
+            print(f"[DEBUG] 显示渲染帧: {pixmap.width()}x{pixmap.height()}")
+    
+    def handle_render_error(self, error_message: str):
+        """处理渲染错误"""
+        print(f"[ERROR] 渲染错误: {error_message}")
+        
+        # 在渲染失败时显示错误信息
+        if self.timeline_mode and self.rendered_frame_label:
+            error_pixmap = QPixmap(400, 300)
+            error_pixmap.fill(Qt.GlobalColor.darkRed)
+            
+            painter = QPainter(error_pixmap)
+            painter.setPen(Qt.GlobalColor.white)
+            painter.setFont(QFont("Arial", 12))
+            painter.drawText(error_pixmap.rect(), Qt.AlignmentFlag.AlignCenter, 
+                           f"渲染错误\n{error_message}")
+            painter.end()
+            
+            self.rendered_frame_label.setPixmap(error_pixmap)
+    
+    def get_timeline_duration(self) -> float:
+        """获取时间轴总时长"""
+        if not self.timeline_widget or not self.timeline_widget.clips:
+            return 0.0
+            
+        # 计算所有剪辑的最大结束时间
+        max_end_time = 0.0
+        for clip in self.timeline_widget.clips:
+            max_end_time = max(max_end_time, clip.end_time)
+            
+        return max_end_time
+    
+    def enable_timeline_preview(self, clips=None):
+        """启用时间轴预览模式"""
+        # 如果传入了clips参数，使用传入的clips；否则使用timeline_widget的clips
+        timeline_clips = clips if clips is not None else (self.timeline_widget.clips if self.timeline_widget else [])
+        
+        if timeline_clips:
+            # 设置时间轴模式
+            self.set_timeline_mode(True)
+            
+            # 更新剪辑列表
+            self.update_timeline_clips(timeline_clips)
+            
+            # 设置预览时长
+            timeline_duration = self.get_timeline_duration()
+            if timeline_duration > 0:
+                duration_ms = int(timeline_duration * 1000)
+                self.position_slider.setRange(0, duration_ms)
+                
+            # 渲染当前位置的帧
+            current_time = self.timeline_widget.current_time if self.timeline_widget else 0.0
+            self.timeline_renderer.render_frame_at_time(current_time)
+            
+            print(f"[DEBUG] 启用时间轴预览模式，时长: {timeline_duration:.2f}秒")
+        else:
+            print("[WARNING] 无法启用时间轴预览：没有剪辑")
+    
+    def disable_timeline_preview(self):
+        """禁用时间轴预览模式"""
+        self.set_timeline_mode(False)
+        print("[DEBUG] 禁用时间轴预览模式")
 
 class MainWindow(QMainWindow):
     """主窗口"""
@@ -2313,10 +2991,19 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("EzCut - 专业视频编辑器")
         self.setGeometry(100, 100, 1400, 900)
         
+        # 初始化项目管理器
+        from project_manager import ProjectManager
+        self.project_manager = ProjectManager()
+        self.current_project_file = None
+        self.project_modified = False
+        
         self.setup_ui()
         self.setup_menus()
         self.setup_toolbar()
         self.setup_statusbar()
+        
+        # 创建新项目
+        self.new_project()
     
     def setup_ui(self):
         """设置主界面"""
@@ -2367,6 +3054,13 @@ class MainWindow(QMainWindow):
         
         # 连接视频预览器的播放状态变化信号到工具栏更新
         self.video_preview.media_player.playbackStateChanged.connect(self.update_toolbar_play_button)
+        
+        # 连接时间轴信号到预览器
+        self.timeline.clips_changed.connect(self.on_timeline_clips_changed)
+        self.timeline.playhead_position_changed.connect(self.on_playhead_position_changed)
+        
+        # 连接媒体库拖拽信号
+        self.media_library.media_dropped.connect(self.timeline.add_media_to_timeline)
         
         center_splitter.addWidget(timeline_container)
         center_splitter.setSizes([400, 300])
@@ -2439,15 +3133,23 @@ class MainWindow(QMainWindow):
         
         new_action = QAction("新建项目", self)
         new_action.setShortcut(QKeySequence.StandardKey.New)
+        new_action.triggered.connect(self.new_project)
         file_menu.addAction(new_action)
         
         open_action = QAction("打开项目", self)
         open_action.setShortcut(QKeySequence.StandardKey.Open)
+        open_action.triggered.connect(self.open_project)
         file_menu.addAction(open_action)
         
         save_action = QAction("保存项目", self)
         save_action.setShortcut(QKeySequence.StandardKey.Save)
+        save_action.triggered.connect(self.save_project)
         file_menu.addAction(save_action)
+        
+        save_as_action = QAction("另存为...", self)
+        save_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        save_as_action.triggered.connect(self.save_project_as)
+        file_menu.addAction(save_as_action)
         
         file_menu.addSeparator()
         
@@ -2596,30 +3298,93 @@ class MainWindow(QMainWindow):
     
     def toggle_timeline_playback(self):
         """切换时间轴播放状态"""
-        if self.video_preview.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            # 当前正在播放，暂停
-            self.video_preview.media_player.pause()
-            self.play_action.setText("▶")
-            self.play_action.setToolTip("播放")
-        else:
-            # 当前暂停或停止，开始播放
-            if self.video_preview.current_media:
-                # 如果有加载的媒体，直接播放
-                self.video_preview.media_player.play()
+        if self.video_preview.timeline_mode:
+            # 时间轴模式下的播放控制
+            if hasattr(self.video_preview, 'timeline_playing') and self.video_preview.timeline_playing:
+                # 暂停时间轴播放
+                self.video_preview.timeline_playing = False
+                self.play_action.setText("▶")
+                self.play_action.setToolTip("播放")
+                print(f"[DEBUG] 暂停时间轴播放")
+            else:
+                # 开始时间轴播放
+                self.video_preview.timeline_playing = True
                 self.play_action.setText("⏸")
                 self.play_action.setToolTip("暂停")
+                print(f"[DEBUG] 开始时间轴播放")
+                # 启动时间轴播放定时器
+                self.start_timeline_playback()
+        else:
+            # 传统媒体播放模式
+            if self.video_preview.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                # 当前正在播放，暂停
+                self.video_preview.media_player.pause()
+                self.play_action.setText("▶")
+                self.play_action.setToolTip("播放")
             else:
-                # 如果没有加载媒体，智能处理播放请求
-                self.smart_play_handler()
+                # 当前暂停或停止，开始播放
+                if self.video_preview.current_media:
+                    # 如果有加载的媒体，直接播放
+                    self.video_preview.media_player.play()
+                    self.play_action.setText("⏸")
+                    self.play_action.setToolTip("暂停")
+                else:
+                    # 如果没有加载媒体，智能处理播放请求
+                    self.smart_play_handler()
     
     def stop_timeline_playback(self):
         """停止时间轴播放"""
-        self.video_preview.media_player.stop()
-        self.play_action.setText("▶")
-        self.play_action.setToolTip("播放")
+        if self.video_preview.timeline_mode:
+            # 停止时间轴播放
+            self.video_preview.timeline_playing = False
+            if hasattr(self, 'timeline_timer'):
+                self.timeline_timer.stop()
+            self.play_action.setText("▶")
+            self.play_action.setToolTip("播放")
+            # 重置播放头到开始位置
+            self.timeline.update_playhead_position(0.0)
+            print(f"[DEBUG] 停止时间轴播放")
+        else:
+            # 传统媒体播放模式
+            self.video_preview.media_player.stop()
+            self.play_action.setText("▶")
+            self.play_action.setToolTip("播放")
+            # 重置播放头到开始位置
+            self.timeline.update_playhead_position(0.0)
+    
+    def start_timeline_playback(self):
+        """启动时间轴播放"""
+        if not hasattr(self, 'timeline_timer'):
+            self.timeline_timer = QTimer()
+            self.timeline_timer.timeout.connect(self.update_timeline_playback)
         
-        # 重置播放头到开始位置
-        self.timeline.update_playhead_position(0.0)
+        # 设置30fps的播放速度
+        self.timeline_timer.start(33)  # 约30fps
+        self.timeline_start_time = time.time()
+        self.timeline_start_position = self.timeline.get_current_time()
+        print(f"[DEBUG] 启动时间轴播放定时器，起始位置: {self.timeline_start_position:.2f}s")
+    
+    def update_timeline_playback(self):
+        """更新时间轴播放位置"""
+        if not hasattr(self.video_preview, 'timeline_playing') or not self.video_preview.timeline_playing:
+            return
+        
+        # 计算当前播放时间
+        elapsed_time = time.time() - self.timeline_start_time
+        current_position = self.timeline_start_position + elapsed_time
+        
+        # 检查是否超出时间轴范围
+        timeline_duration = self.video_preview.get_timeline_duration()
+        if current_position >= timeline_duration:
+            # 播放结束，停止播放
+            self.stop_timeline_playback()
+            return
+        
+        # 更新播放头位置
+        self.timeline.update_playhead_position(current_position)
+        
+        # 更新预览帧（这会触发渲染）
+        self.video_preview.seek_timeline_position(current_position)
     
     def smart_play_handler(self):
         """智能播放处理器 - 自动处理媒体加载和播放"""
@@ -2720,6 +3485,28 @@ class MainWindow(QMainWindow):
             # 同步更新视频预览器的播放按钮
             self.video_preview.play_btn.setText("⏸")
     
+    def on_timeline_clips_changed(self):
+        """时间轴剪辑变化时的处理"""
+        print(f"[DEBUG] 时间轴剪辑发生变化，剪辑数量: {len(self.timeline.clips)}")
+        
+        if self.timeline.clips:
+            # 有剪辑时启用时间轴预览模式
+            print(f"[DEBUG] 启用时间轴预览模式")
+            self.video_preview.enable_timeline_preview(self.timeline.clips)
+        else:
+            # 没有剪辑时禁用时间轴预览模式
+            print(f"[DEBUG] 禁用时间轴预览模式")
+            self.video_preview.disable_timeline_preview()
+        
+        # 标记项目为已修改
+        self.mark_project_modified()
+    
+    def on_playhead_position_changed(self, position):
+        """播放头位置变化时的处理"""
+        if self.video_preview.timeline_mode:
+            # 在时间轴模式下，跳转到对应位置
+            self.video_preview.seek_timeline_position(position)
+    
     def export_selected_segment(self):
         """导出选中的时间片段"""
         time_range = self.timeline.get_selected_time_range()
@@ -2805,6 +3592,259 @@ class MainWindow(QMainWindow):
             self.play_action.setToolTip("播放")
             # 同步更新视频预览器的播放按钮
             self.video_preview.play_btn.setText("▶")
+    
+    def new_project(self):
+        """新建项目"""
+        if self.project_modified:
+            reply = QMessageBox.question(
+                self,
+                "新建项目",
+                "当前项目已修改，是否保存？",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save
+            )
+            
+            if reply == QMessageBox.StandardButton.Save:
+                if not self.save_project():
+                    return  # 保存失败，取消新建
+            elif reply == QMessageBox.StandardButton.Cancel:
+                return  # 用户取消
+        
+        # 创建新项目
+        self.project_manager.new_project()
+        self.current_project_file = None
+        self.project_modified = False
+        
+        # 清空界面
+        self.media_library.clear_media()
+        self.timeline.set_clips([])
+        
+        # 更新窗口标题
+        self.update_window_title()
+        
+        self.statusBar().showMessage("新项目已创建")
+    
+    def open_project(self):
+        """打开项目"""
+        if self.project_modified:
+            reply = QMessageBox.question(
+                self,
+                "打开项目",
+                "当前项目已修改，是否保存？",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save
+            )
+            
+            if reply == QMessageBox.StandardButton.Save:
+                if not self.save_project():
+                    return  # 保存失败，取消打开
+            elif reply == QMessageBox.StandardButton.Cancel:
+                return  # 用户取消
+        
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "打开项目文件",
+            "",
+            "EzCut项目文件 (*.ezcut);;所有文件 (*)"
+        )
+        
+        if file_path:
+            if self.project_manager.load_project(file_path):
+                self.current_project_file = file_path
+                self.project_modified = False
+                self.load_project_data()
+                self.update_window_title()
+                self.statusBar().showMessage(f"项目已打开: {file_path}")
+            else:
+                QMessageBox.critical(self, "错误", "无法打开项目文件")
+    
+    def save_project(self):
+        """保存项目"""
+        if self.current_project_file:
+            return self.save_project_to_file(self.current_project_file)
+        else:
+            return self.save_project_as()
+    
+    def save_project_as(self):
+        """另存为项目"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存项目文件",
+            "",
+            "EzCut项目文件 (*.ezcut);;所有文件 (*)"
+        )
+        
+        if file_path:
+            if not file_path.endswith('.ezcut'):
+                file_path += '.ezcut'
+            
+            if self.save_project_to_file(file_path):
+                self.current_project_file = file_path
+                return True
+        
+        return False
+    
+    def save_project_to_file(self, file_path):
+        """保存项目到指定文件"""
+        try:
+            # 收集当前项目数据
+            self.collect_project_data()
+            
+            # 保存项目
+            if self.project_manager.save_project(file_path):
+                self.project_modified = False
+                self.update_window_title()
+                self.statusBar().showMessage(f"项目已保存: {file_path}")
+                return True
+            else:
+                QMessageBox.critical(self, "错误", "保存项目失败")
+                return False
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存项目时发生错误: {str(e)}")
+            return False
+    
+    def collect_project_data(self):
+        """收集当前项目数据"""
+        if not self.project_manager.current_project:
+            return
+        
+        # 清空现有数据
+        self.project_manager.current_project['media_items'] = []
+        self.project_manager.current_project['timeline_clips'] = []
+        
+        # 收集媒体库数据
+        for media_item in self.media_library.media_items:
+            media_data = {
+                'id': getattr(media_item, 'id', str(id(media_item))),
+                'name': media_item.name,
+                'file_path': media_item.file_path,
+                'media_type': media_item.media_type,
+                'duration': media_item.duration,
+                'fps': getattr(media_item, 'fps', 30.0),
+                'width': getattr(media_item, 'width', 1920),
+                'height': getattr(media_item, 'height', 1080),
+                'file_size': getattr(media_item, 'file_size', 0),
+                'imported_at': getattr(media_item, 'imported_at', '')
+            }
+            self.project_manager.add_media_item(media_data)
+        
+        # 收集时间轴剪辑数据
+        for clip in self.timeline.clips:
+            clip_data = {
+                'id': getattr(clip, 'id', str(id(clip))),
+                'media_id': getattr(clip.media_item, 'id', str(id(clip.media_item))),
+                'track': getattr(clip, 'track', 0),
+                'start_time': clip.start_time,
+                'duration': clip.duration,
+                'in_point': getattr(clip, 'in_point', 0.0),
+                'out_point': getattr(clip, 'out_point', clip.duration),
+                'effects': getattr(clip, 'effects', []),
+                'properties': getattr(clip, 'properties', {})
+            }
+            self.project_manager.add_timeline_clip(clip_data)
+    
+    def load_project_data(self):
+        """加载项目数据到界面"""
+        if not self.project_manager.current_project:
+            return
+        
+        project_data = self.project_manager.current_project
+        
+        # 清空当前界面
+        self.media_library.clear_media()
+        self.timeline.set_clips([])
+        
+        # 加载媒体项目
+        for media_data in project_data.get('media_items', []):
+            try:
+                media_item = MediaItem(
+                    name=media_data['name'],
+                    file_path=media_data['file_path'],
+                    media_type=media_data['media_type'],
+                    duration=media_data['duration']
+                )
+                # 设置额外属性
+                media_item.id = media_data.get('id', str(id(media_item)))
+                media_item.fps = media_data.get('fps', 30.0)
+                media_item.width = media_data.get('width', 1920)
+                media_item.height = media_data.get('height', 1080)
+                media_item.file_size = media_data.get('file_size', 0)
+                media_item.imported_at = media_data.get('imported_at', '')
+                
+                self.media_library.add_media_item(media_item)
+            except Exception as e:
+                print(f"加载媒体项目失败: {e}")
+        
+        # 加载时间轴剪辑
+        clips = []
+        for clip_data in project_data.get('timeline_clips', []):
+            try:
+                # 查找对应的媒体项目
+                media_item = None
+                for item in self.media_library.media_items:
+                    if getattr(item, 'id', str(id(item))) == clip_data['media_id']:
+                        media_item = item
+                        break
+                
+                if media_item:
+                    clip = TimelineClip(
+                        media_item=media_item,
+                        start_time=clip_data['start_time'],
+                        duration=clip_data['duration']
+                    )
+                    # 设置额外属性
+                    clip.id = clip_data.get('id', str(id(clip)))
+                    clip.track = clip_data.get('track', 0)
+                    clip.in_point = clip_data.get('in_point', 0.0)
+                    clip.out_point = clip_data.get('out_point', clip.duration)
+                    clip.effects = clip_data.get('effects', [])
+                    clip.properties = clip_data.get('properties', {})
+                    
+                    clips.append(clip)
+            except Exception as e:
+                print(f"加载时间轴剪辑失败: {e}")
+        
+        self.timeline.set_clips(clips)
+    
+    def update_window_title(self):
+        """更新窗口标题"""
+        title = "EzCut - 专业视频编辑器"
+        
+        if self.project_manager.current_project:
+            project_name = self.project_manager.current_project.get('name', '未命名项目')
+            title = f"{project_name} - {title}"
+        
+        if self.project_modified:
+            title += " *"
+        
+        self.setWindowTitle(title)
+    
+    def mark_project_modified(self):
+        """标记项目已修改"""
+        if not self.project_modified:
+            self.project_modified = True
+            self.update_window_title()
+    
+    def closeEvent(self, event):
+        """窗口关闭事件"""
+        if self.project_modified:
+            reply = QMessageBox.question(
+                self,
+                "退出程序",
+                "当前项目已修改，是否保存？",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save
+            )
+            
+            if reply == QMessageBox.StandardButton.Save:
+                if not self.save_project():
+                    event.ignore()
+                    return
+            elif reply == QMessageBox.StandardButton.Cancel:
+                event.ignore()
+                return
+        
+        event.accept()
     
     def show_about(self):
         """显示关于对话框"""
